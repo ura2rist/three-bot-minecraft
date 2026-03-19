@@ -1,0 +1,7 @@
+{
+  "behavior": {
+    "enabled": true,
+    "preferredVillager": "farmer",
+    "maxDistance": 16
+  }
+}

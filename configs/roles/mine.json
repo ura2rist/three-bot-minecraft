@@ -1,0 +1,7 @@
+{
+  "behavior": {
+    "enabled": true,
+    "targetBlock": "diamond_ore",
+    "maxDepth": 12
+  }
+}

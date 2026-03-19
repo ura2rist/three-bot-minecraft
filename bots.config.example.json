@@ -1,0 +1,19 @@
+{
+  "bots": [
+    {
+      "role": "mine",
+      "username": "MinerOne",
+      "password": "change_me"
+    },
+    {
+      "role": "farm",
+      "username": "FarmerOne",
+      "password": "change_me"
+    },
+    {
+      "role": "trading",
+      "username": "TraderOne",
+      "password": "change_me"
+    }
+  ]
+}

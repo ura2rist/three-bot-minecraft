@@ -1,0 +1,7 @@
+{
+  "behavior": {
+    "enabled": true,
+    "crop": "wheat",
+    "autoReplant": true
+  }
+}

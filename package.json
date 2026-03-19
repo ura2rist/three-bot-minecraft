@@ -1,0 +1,31 @@
+{
+  "name": "mine-bot",
+  "version": "1.0.0",
+  "description": "Minecraft bot project on Node.js, TypeScript and mineflayer with DDD architecture.",
+  "main": "dist/main.js",
+  "scripts": {
+    "build": "node -e \"require('fs').rmSync('dist', { recursive: true, force: true })\" && node ./node_modules/typescript/bin/tsc -p tsconfig.json",
+    "dev": "node ./node_modules/ts-node/dist/bin.js src/main.ts",
+    "start": "node dist/main.js",
+    "typecheck": "node ./node_modules/typescript/bin/tsc --noEmit -p tsconfig.json"
+  },
+  "keywords": [
+    "minecraft",
+    "mineflayer",
+    "bot",
+    "typescript",
+    "ddd"
+  ],
+  "author": "",
+  "license": "MIT",
+  "type": "commonjs",
+  "dependencies": {
+    "dotenv": "^17.3.1",
+    "mineflayer": "^4.35.0"
+  },
+  "devDependencies": {
+    "@types/node": "^25.5.0",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.9.3"
+  }
+}
