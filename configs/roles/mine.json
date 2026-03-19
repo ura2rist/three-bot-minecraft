@@ -1,7 +1,8 @@
 {
-  "behavior": {
-    "enabled": true,
-    "targetBlock": "diamond_ore",
-    "maxDepth": 12
+  "shaft": {
+    "targetDepthY": 12,
+    "shaftHeight": 3,
+    "shaftWidth": 2,
+    "shaftLength": 24
   }
 }

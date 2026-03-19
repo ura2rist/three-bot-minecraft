@@ -96,7 +96,52 @@ BOTS_CONFIG_PATH=./bots.config.json
 - `configs/roles/trading.json`
 - `configs/roles/mine.json`
 
-Сейчас это заготовки под дальнейшую настройку логики ролей.
+Структура конфигов такая:
+
+- `farm.json` - список выращиваемых продуктов и количество ячеек под каждый продукт.
+- `mine.json` - глубина копания, высота шахты, ширина и длина шахты.
+- `trading.json` - список обменов, где задаётся, что игрок отдаёт боту и что бот отдаёт игроку.
+
+Пример `farm.json`:
+
+```json
+{
+  "products": [
+    { "itemId": "wheat", "slotCount": 6 },
+    { "itemId": "carrot", "slotCount": 3 }
+  ]
+}
+```
+
+Пример `mine.json`:
+
+```json
+{
+  "shaft": {
+    "targetDepthY": 12,
+    "shaftHeight": 3,
+    "shaftWidth": 2,
+    "shaftLength": 24
+  }
+}
+```
+
+Пример `trading.json`:
+
+```json
+{
+  "offers": [
+    {
+      "playerGives": [
+        { "itemId": "bread", "amount": 2 }
+      ],
+      "botGives": [
+        { "itemId": "iron_ingot", "amount": 1 }
+      ]
+    }
+  ]
+}
+```
 
 ## Переменные окружения
 

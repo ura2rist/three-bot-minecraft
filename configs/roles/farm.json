@@ -1,7 +1,12 @@
 {
-  "behavior": {
-    "enabled": true,
-    "crop": "wheat",
-    "autoReplant": true
-  }
+  "products": [
+    {
+      "itemId": "wheat",
+      "slotCount": 6
+    },
+    {
+      "itemId": "carrot",
+      "slotCount": 3
+    }
+  ]
 }

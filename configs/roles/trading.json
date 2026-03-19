@@ -1,7 +1,18 @@
 {
-  "behavior": {
-    "enabled": true,
-    "preferredVillager": "farmer",
-    "maxDistance": 16
-  }
+  "offers": [
+    {
+      "playerGives": [
+        {
+          "itemId": "bread",
+          "amount": 2
+        }
+      ],
+      "botGives": [
+        {
+          "itemId": "iron_ingot",
+          "amount": 1
+        }
+      ]
+    }
+  ]
 }

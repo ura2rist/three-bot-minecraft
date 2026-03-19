@@ -2,17 +2,17 @@
   "bots": [
     {
       "role": "mine",
-      "username": "MinerOne",
+      "username": "Gimli",
       "password": "change_me"
     },
     {
       "role": "farm",
-      "username": "FarmerOne",
+      "username": "Gamgee",
       "password": "change_me"
     },
     {
       "role": "trading",
-      "username": "TraderOne",
+      "username": "Lawrence",
       "password": "change_me"
     }
   ]
