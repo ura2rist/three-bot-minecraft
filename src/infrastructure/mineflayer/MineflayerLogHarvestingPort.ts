@@ -56,11 +56,20 @@ export class MineflayerLogHarvestingPort implements LogHarvestingPort {
       );
     }
 
+    const groundY = this.findGroundY(targetLog.position);
+
+    if (groundY === null) {
+      throw new Error(`Could not determine the ground level for log block "${targetLog.name}".`);
+    }
+
     this.logger.info(
       `Gathering log block ${targetLog.name} at ${targetLog.position.x} ${targetLog.position.y} ${targetLog.position.z}.`,
     );
 
-    await this.gotoPosition(targetLog.position, 2);
+    if (!this.canDigFromCurrentPosition(targetLog.position)) {
+      const approachPosition = new Vec3(targetLog.position.x, groundY + 1, targetLog.position.z);
+      await this.gotoPosition(approachPosition, 3);
+    }
 
     if (!this.bot.canDigBlock(targetLog)) {
       throw new Error(`Cannot dig log block "${targetLog.name}" at the target position.`);
@@ -111,5 +120,9 @@ export class MineflayerLogHarvestingPort implements LogHarvestingPort {
     const dz = this.bot.entity.position.z - target.z;
 
     return dx * dx + dy * dy + dz * dz;
+  }
+
+  private canDigFromCurrentPosition(target: Vec3): boolean {
+    return this.calculateDistanceSquared(target) <= 16;
   }
 }
