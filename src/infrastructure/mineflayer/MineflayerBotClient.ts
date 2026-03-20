@@ -50,6 +50,10 @@ export class MineflayerBotClient implements BotClient {
     process.env.BOT_RALLY_SINGLE_ATTEMPT_TIMEOUT_MS,
     15000,
   );
+  private readonly rallyStabilizationTicks = this.parseInteger(
+    process.env.BOT_RALLY_STABILIZATION_TICKS,
+    20,
+  );
   private readonly configurationFallbackDelayMs = this.parseInteger(
     process.env.BOT_CONFIGURATION_FALLBACK_DELAY_MS,
     1500,
@@ -252,9 +256,9 @@ export class MineflayerBotClient implements BotClient {
     //   logger.info(`Keep-alive packet received in state "${String(bot._client.state)}".`);
     // });
 
-    bot._client.on('registry_data', () => {
-      logger.info('Registry data packet received.');
-    });
+    // bot._client.on('registry_data', () => {
+    //   logger.info('Registry data packet received.');
+    // });
 
     bot._client.on('feature_flags', () => {
       logger.info('Feature flags packet received.');
@@ -423,9 +427,11 @@ export class MineflayerBotClient implements BotClient {
     return (
       message.includes('no path to the goal') ||
       message.includes('timed out') ||
+      message.includes('timeout waiting for') ||
       message.includes('stuck') ||
       message.includes('goal changed') ||
-      message.includes('path stopped')
+      message.includes('path stopped') ||
+      message.includes('goal was not actually reached')
     );
   }
 
@@ -476,11 +482,15 @@ export class MineflayerBotClient implements BotClient {
     const movements = this.createRallyMovements(bot);
     const deadline = Date.now() + this.rallyTimeoutMs;
 
+    if (this.rallyStabilizationTicks > 0) {
+      await bot.waitForTicks(this.rallyStabilizationTicks);
+    }
+
     while (Date.now() < deadline) {
       bot.pathfinder.setMovements(movements);
 
       try {
-        await bot.waitForChunksToLoad();
+        await this.waitForChunksForRally(bot, logger);
 
         const attemptTimeoutMs = Math.min(
           this.rallySingleAttemptTimeoutMs,
@@ -506,6 +516,14 @@ export class MineflayerBotClient implements BotClient {
           throw new Error('Bot entity is unavailable after pathfinding completed.');
         }
 
+        const distanceToGoal = this.calculateDistanceToGoal(bot, configuration);
+
+        if (distanceToGoal > this.rallyGoalRange + 1.5) {
+          throw new Error(
+            `Goal was not actually reached. Remaining distance: ${distanceToGoal.toFixed(2)} blocks.`,
+          );
+        }
+
         logger.info(
           `Reached rally point at ${bot.entity.position.x.toFixed(2)} ${bot.entity.position.y.toFixed(2)} ${bot.entity.position.z.toFixed(2)}.`,
         );
@@ -527,6 +545,28 @@ export class MineflayerBotClient implements BotClient {
     throw new Error(
       `Timed out after ${this.rallyTimeoutMs}ms before reaching ${configuration.rallyPoint.x} ${configuration.rallyPoint.y} ${configuration.rallyPoint.z}.`,
     );
+  }
+
+  private async waitForChunksForRally(bot: BotWithClient, logger: Logger): Promise<void> {
+    try {
+      await bot.waitForChunksToLoad();
+    } catch (error) {
+      logger.warn(
+        `Chunks are still loading near the route. Continuing with the currently available world data: ${this.stringifyError(error)}.`,
+      );
+    }
+  }
+
+  private calculateDistanceToGoal(bot: BotWithClient, configuration: BotConfiguration): number {
+    if (!bot.entity || !configuration.rallyPoint) {
+      return Number.POSITIVE_INFINITY;
+    }
+
+    const dx = bot.entity.position.x - configuration.rallyPoint.x;
+    const dy = bot.entity.position.y - configuration.rallyPoint.y;
+    const dz = bot.entity.position.z - configuration.rallyPoint.z;
+
+    return Math.sqrt(dx * dx + dy * dy + dz * dz);
   }
 
   private waitForChatBlockMessage(bot: BotWithClient, timeoutMs: number): Promise<boolean> {
