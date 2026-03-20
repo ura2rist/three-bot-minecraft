@@ -7,7 +7,13 @@ export async function bootstrapBot(): Promise<void> {
   const logger = new ConsoleLogger();
   const configurationProvider = new FileBotFleetConfigurationProvider();
   const botClient = new MineflayerBotClient(logger);
-  const useCase = new StartBotsUseCase(configurationProvider, botClient, logger);
+  const startupDelayMs = Number.parseInt(process.env.BOT_START_DELAY_MS ?? '5000', 10);
+  const useCase = new StartBotsUseCase(
+    configurationProvider,
+    botClient,
+    logger,
+    Number.isFinite(startupDelayMs) ? startupDelayMs : 5000,
+  );
 
   try {
     await useCase.execute();

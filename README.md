@@ -29,6 +29,13 @@ cp bots.config.example.json bots.config.json
 npm run dev
 ```
 
+После входа каждый бот проходит сценарий:
+
+1. подключение к серверу
+2. `/register <password> <password>`
+3. `/login <password>`
+4. отправка сообщения `hi`
+
 ## Сборка
 
 Сборка TypeScript в `dist`:
@@ -53,6 +60,7 @@ npm run start
 - `bots.config.json` хранит только данные конкретных ботов: `role`, `username`, `password`.
 - Допустимые роли строго ограничены: `farm`, `trading`, `mine`.
 - Каждая роль может быть указана только один раз.
+- Пароль обязателен, потому что используется для регистрации и логина через LightAuth.
 
 Пример `.env`:
 
@@ -62,6 +70,11 @@ BOT_PORT=25565
 BOT_VERSION=1.20.4
 BOT_AUTH=offline
 BOTS_CONFIG_PATH=./bots.config.json
+BOT_START_DELAY_MS=5000
+BOT_LOGIN_TIMEOUT_MS=20000
+BOT_SPAWN_TIMEOUT_MS=20000
+BOT_CONNECT_RETRY_DELAY_MS=7000
+BOT_CONNECT_MAX_RETRIES=2
 ```
 
 Пример `bots.config.json`:
@@ -150,6 +163,26 @@ BOTS_CONFIG_PATH=./bots.config.json
 - `BOT_VERSION` - общая версия клиента Minecraft.
 - `BOT_AUTH` - общий тип авторизации `offline` или `microsoft`.
 - `BOTS_CONFIG_PATH` - путь до файла `bots.config.json`.
+- `BOT_LOGIN_TIMEOUT_MS` - сколько ждать сетевой `login` от сервера.
+- `BOT_SPAWN_TIMEOUT_MS` - сколько ждать `spawn` после успешной авторизации.
+- `BOT_START_DELAY_MS` - пауза между стартом разных ботов, чтобы не упереться в server throttle.
+- `BOT_CONNECT_RETRY_DELAY_MS` - пауза перед повторной попыткой после `Connection throttled`.
+- `BOT_CONNECT_MAX_RETRIES` - сколько раз повторять попытку подключения при throttle.
+- `LIGHTAUTH_REGISTER_COMMAND` - команда регистрации, по умолчанию `/register`.
+- `LIGHTAUTH_LOGIN_COMMAND` - команда логина, по умолчанию `/login`.
+- `LIGHTAUTH_COMMAND_DELAY_MS` - задержка между auth-командами.
+- `LIGHTAUTH_TIMEOUT_MS` - таймаут ожидания ответа от LightAuth.
+
+## Логгер
+
+В проекте есть единый общий логгер для всех ботов. Он:
+
+- пишет `info`, `warn`, `error`
+- хранит общую историю записей в памяти
+- поддерживает контекст по роли бота
+- пишет ошибки подключения, регистрации, логина и таймаутов авторизации
+
+Это зафиксировано в [src/infrastructure/logging/ConsoleLogger.ts](src/infrastructure/logging/ConsoleLogger.ts) и [src/application/shared/ports/Logger.ts](src/application/shared/ports/Logger.ts).
 
 ## DDD-структура
 

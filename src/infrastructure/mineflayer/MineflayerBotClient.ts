@@ -2,25 +2,76 @@ import mineflayer from 'mineflayer';
 import { BotClient } from '../../application/bot/ports/BotClient';
 import { BotConfiguration } from '../../domain/bot/entities/BotConfiguration';
 import { Logger } from '../../application/shared/ports/Logger';
+import { LightAuthBotAuthenticator } from './LightAuthBotAuthenticator';
+
+type BotWithClient = mineflayer.Bot & {
+  _client: mineflayer.Bot['_client'] & {
+    _lastDisconnectReason?: string;
+  };
+};
 
 export class MineflayerBotClient implements BotClient {
+  private readonly loginTimeoutMs = this.parseInteger(process.env.BOT_LOGIN_TIMEOUT_MS, 20000);
+  private readonly spawnTimeoutMs = this.parseInteger(process.env.BOT_SPAWN_TIMEOUT_MS, 20000);
+  private readonly retryDelayMs = this.parseInteger(process.env.BOT_CONNECT_RETRY_DELAY_MS, 7000);
+  private readonly maxRetries = this.parseInteger(process.env.BOT_CONNECT_MAX_RETRIES, 2);
+
   constructor(private readonly logger: Logger) {}
 
   async connect(configuration: BotConfiguration): Promise<void> {
+    let attempt = 0;
+
+    while (attempt <= this.maxRetries) {
+      try {
+        await this.connectOnce(configuration);
+        return;
+      } catch (error) {
+        const isLastAttempt = attempt >= this.maxRetries;
+
+        if (!this.isConnectionThrottled(error) || isLastAttempt) {
+          throw error;
+        }
+
+        this.logger
+          .child(configuration.role)
+          .warn(
+            `Server throttled the connection. Retrying in ${this.retryDelayMs}ms (attempt ${attempt + 2}/${this.maxRetries + 1}).`,
+          );
+
+        await this.delay(this.retryDelayMs);
+      }
+
+      attempt += 1;
+    }
+  }
+
+  private async connectOnce(configuration: BotConfiguration): Promise<void> {
+    const logger = this.logger.child(configuration.role);
     const bot = mineflayer.createBot({
       host: configuration.host,
       port: configuration.port,
       username: configuration.username,
       version: configuration.version,
       auth: configuration.auth,
+    }) as BotWithClient;
+    const authenticator = new LightAuthBotAuthenticator(logger);
+    let hasSpawned = false;
+
+    bot._client.on('connect', () => {
+      logger.info('TCP connection established.');
+    });
+
+    bot.on('inject_allowed', () => {
+      logger.info('Mineflayer injection allowed.');
     });
 
     bot.on('login', () => {
-      this.logger.info(`Bot "${configuration.role}" logged in as "${configuration.username}".`);
+      logger.info(`Bot logged in as "${configuration.username}".`);
     });
 
     bot.on('spawn', () => {
-      this.logger.info(`Bot "${configuration.role}" spawned in the world.`);
+      hasSpawned = true;
+      logger.info('Bot spawned in the world.');
     });
 
     bot.on('chat', (username, message) => {
@@ -28,30 +79,156 @@ export class MineflayerBotClient implements BotClient {
         return;
       }
 
-      this.logger.info(`[${configuration.role}] [CHAT] ${username}: ${message}`);
+      logger.info(`[CHAT] ${username}: ${message}`);
+    });
+
+    bot.on('messagestr', (message) => {
+      logger.info(`[SERVER] ${message}`);
+    });
+
+    bot._client.on('disconnect', (packet: { reason?: unknown }) => {
+      bot._client._lastDisconnectReason = String(packet.reason ?? 'unknown disconnect reason');
+      logger.warn(`Disconnect packet received: ${bot._client._lastDisconnectReason}`);
+    });
+
+    bot._client.on('login', () => {
+      logger.info('Low-level login packet received.');
+    });
+
+    bot._client.on('success', () => {
+      logger.info('Low-level login success packet received.');
+    });
+
+    bot._client.on('compress', () => {
+      logger.info('Compression packet received.');
     });
 
     bot.on('end', (reason) => {
-      this.logger.info(`Bot "${configuration.role}" connection ended: ${reason ?? 'unknown reason'}`);
+      logger.info(`Bot connection ended: ${reason ?? 'unknown reason'}`);
     });
 
     bot.on('kicked', (reason) => {
-      this.logger.error(`Bot "${configuration.role}" was kicked: ${String(reason)}`);
+      logger.error(`Bot was kicked: ${String(reason)}`);
     });
 
     bot.on('error', (error) => {
-      this.logger.error(`Mineflayer client error for bot "${configuration.role}".`, error);
+      logger.error('Mineflayer client error.', error);
     });
 
-    await new Promise<void>((resolve, reject) => {
-      bot.once('spawn', () => resolve());
-      bot.once('error', (error) => reject(error));
-      bot.once('kicked', (reason) =>
-        reject(new Error(`Bot "${configuration.role}" was kicked before spawn: ${String(reason)}`)),
-      );
-      bot.once('end', () =>
-        reject(new Error(`Bot "${configuration.role}" disconnected before spawn.`)),
-      );
+    await this.waitForLogin(bot, configuration);
+
+    try {
+      await authenticator.authenticate(bot, configuration);
+    } catch (error) {
+      logger.error('LightAuth authorization failed.', error);
+      bot.end();
+      throw error;
+    }
+
+    if (!hasSpawned) {
+      await this.waitForSpawn(bot, configuration);
+    }
+
+    bot.chat('hi');
+    logger.info('Sent chat message "hi".');
+  }
+
+  private waitForLogin(bot: BotWithClient, configuration: BotConfiguration): Promise<void> {
+    return new Promise((resolve, reject) => {
+      if (bot._client.state === 'play') {
+        resolve();
+        return;
+      }
+
+      const timeoutId = setTimeout(() => {
+        cleanup();
+        reject(
+          new Error(
+            `Bot "${configuration.role}" login timed out after ${this.loginTimeoutMs}ms. Current state: ${String(bot._client.state)}.${this.formatDisconnectReason(bot)}`,
+          ),
+        );
+      }, this.loginTimeoutMs);
+      const intervalId = setInterval(() => {
+        if (bot._client.state === 'play') {
+          cleanup();
+          resolve();
+        }
+      }, 100);
+
+      const cleanup = () => {
+        clearTimeout(timeoutId);
+        clearInterval(intervalId);
+      };
     });
+  }
+
+  private waitForSpawn(bot: BotWithClient, configuration: BotConfiguration): Promise<void> {
+    return new Promise((resolve, reject) => {
+      if (bot.entity) {
+        resolve();
+        return;
+      }
+
+      const timeoutId = setTimeout(() => {
+        cleanup();
+        reject(
+          new Error(
+            `Bot "${configuration.role}" spawn timed out after auth.${this.formatDisconnectReason(bot)}`,
+          ),
+        );
+      }, this.spawnTimeoutMs);
+
+      const intervalId = setInterval(() => {
+        if (bot.entity) {
+          cleanup();
+          resolve();
+        }
+      }, 100);
+
+      const cleanup = () => {
+        clearTimeout(timeoutId);
+        clearInterval(intervalId);
+        bot.off('spawn', handleSpawn);
+      };
+
+      const handleSpawn = () => {
+        cleanup();
+        resolve();
+      };
+
+      bot.once('spawn', handleSpawn);
+    });
+  }
+
+  private isConnectionThrottled(error: unknown): boolean {
+    if (!(error instanceof Error)) {
+      return false;
+    }
+
+    const message = error.message.toLowerCase();
+
+    return message.includes('connection throttled') || message.includes('please wait before reconnecting');
+  }
+
+  private formatDisconnectReason(bot: BotWithClient): string {
+    if (!bot._client._lastDisconnectReason) {
+      return '';
+    }
+
+    return ` Disconnect reason: ${bot._client._lastDisconnectReason}`;
+  }
+
+  private parseInteger(value: string | undefined, fallback: number): number {
+    const parsed = Number.parseInt(value ?? '', 10);
+
+    if (!Number.isFinite(parsed)) {
+      return fallback;
+    }
+
+    return parsed;
+  }
+
+  private async delay(ms: number): Promise<void> {
+    await new Promise((resolve) => setTimeout(resolve, ms));
   }
 }

@@ -41,6 +41,10 @@ export class BotConfiguration {
       throw new DomainError(`Bot "${role}": username must not be empty.`);
     }
 
+    if (!password) {
+      throw new DomainError(`Bot "${role}": password must not be empty for LightAuth.`);
+    }
+
     if (!Number.isInteger(props.port) || props.port < 1 || props.port > 65535) {
       throw new DomainError(`Bot "${role}": port must be an integer between 1 and 65535.`);
     }
@@ -49,7 +53,7 @@ export class BotConfiguration {
     this.host = host;
     this.port = props.port;
     this.username = username;
-    this.password = password || undefined;
+    this.password = password;
     this.version = version || undefined;
     this.auth = props.auth;
   }

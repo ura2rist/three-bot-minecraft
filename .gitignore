@@ -4,3 +4,5 @@ dist
 npm-debug.log*
 AGENTS.md
 bots.config.json
+.idea/
+*.iml
