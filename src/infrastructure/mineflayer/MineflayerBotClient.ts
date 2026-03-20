@@ -5,6 +5,7 @@ import { Logger } from '../../application/shared/ports/Logger';
 import { LightAuthBotAuthenticator } from './LightAuthBotAuthenticator';
 import { CraftingTableCoordinator } from './CraftingTableCoordinator';
 import { CraftingTableProvisioner } from './CraftingTableProvisioner';
+import type { BotWithPathfinder } from './CraftingTableProvisioner';
 
 const mineflayerPathfinder = require('../../../.vendor/mineflayer-pathfinder-master');
 const pathfinderPlugin = mineflayerPathfinder.pathfinder as (bot: mineflayer.Bot) => void;
@@ -44,7 +45,7 @@ interface StringEventBot {
 }
 
 type BotWithClient = mineflayer.Bot & {
-  pathfinder: PathfinderApi;
+  pathfinder?: PathfinderApi;
   _client: mineflayer.Bot['_client'] & {
     _lastDisconnectReason?: string;
   };
@@ -166,8 +167,6 @@ export class MineflayerBotClient implements BotClient {
       auth: configuration.auth,
     }) as BotWithClient;
     bot.loadPlugin(pathfinderPlugin);
-    bot.pathfinder.thinkTimeout = this.pathfinderThinkTimeoutMs;
-    bot.pathfinder.tickTimeout = this.pathfinderTickTimeoutMs;
 
     const authenticator = new LightAuthBotAuthenticator(logger);
     let hasSpawned = false;
@@ -179,6 +178,14 @@ export class MineflayerBotClient implements BotClient {
     let configurationFallbackTriggered = false;
     let rallyNavigationPromise: Promise<void> | null = null;
     let rallyNavigationAttempt = 0;
+    const configurePathfinder = () => {
+      if (!bot.pathfinder) {
+        return;
+      }
+
+      bot.pathfinder.thinkTimeout = this.pathfinderThinkTimeoutMs;
+      bot.pathfinder.tickTimeout = this.pathfinderTickTimeoutMs;
+    };
 
     const sendConfigurationSettings = () => {
       if (configurationSettingsSent || bot._client.state !== 'configuration') {
@@ -196,7 +203,7 @@ export class MineflayerBotClient implements BotClient {
 
       rallyNavigationAttempt += 1;
       rallyNavigationPromise = null;
-      bot.pathfinder.stop();
+      bot.pathfinder?.stop();
       logger.info(`Stopped rally navigation: ${reason}.`);
     };
     const scheduleReconnect = (reason: string) => {
@@ -229,7 +236,11 @@ export class MineflayerBotClient implements BotClient {
 
       rallyNavigationPromise = this.moveToRallyPoint(bot, configuration, logger)
         .then(async () => {
-          await this.craftingTableProvisioner.ensureNearRallyPoint(bot, configuration, logger);
+          await this.craftingTableProvisioner.ensureNearRallyPoint(
+            this.requirePathfinderBot(bot),
+            configuration,
+            logger,
+          );
         })
         .catch((error) => {
           if (attempt !== rallyNavigationAttempt) {
@@ -250,6 +261,7 @@ export class MineflayerBotClient implements BotClient {
     });
 
     bot.on('inject_allowed', () => {
+      configurePathfinder();
       logger.info('Mineflayer injection allowed.');
     });
 
@@ -535,6 +547,10 @@ export class MineflayerBotClient implements BotClient {
     configuration: BotConfiguration,
     logger: Logger,
   ): Promise<void> {
+    if (!bot.pathfinder) {
+      throw new Error('Pathfinder plugin is not available on the bot instance.');
+    }
+
     if (!bot.entity) {
       logger.warn('Skipping rally movement because the bot entity is not available.');
       return;
@@ -753,6 +769,10 @@ export class MineflayerBotClient implements BotClient {
   }
 
   private createRallyMovements(bot: BotWithClient): PathfinderMovements {
+    if (!bot.pathfinder) {
+      throw new Error('Pathfinder plugin is not available while creating rally movements.');
+    }
+
     const movements = new Movements(bot);
     movements.canDig = false;
     movements.allow1by1towers = false;
@@ -761,6 +781,14 @@ export class MineflayerBotClient implements BotClient {
     movements.canOpenDoors = true;
     movements.maxDropDown = 4;
     return movements;
+  }
+
+  private requirePathfinderBot(bot: BotWithClient): BotWithPathfinder {
+    if (!bot.pathfinder) {
+      throw new Error('Pathfinder plugin is not available on the bot instance.');
+    }
+
+    return bot as BotWithPathfinder;
   }
 
   private getBotKey(configuration: BotConfiguration): string {

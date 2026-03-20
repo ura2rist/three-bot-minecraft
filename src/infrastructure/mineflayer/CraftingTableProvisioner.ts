@@ -40,7 +40,7 @@ interface RegistryLookup {
   blocksByName: Record<string, RegistryEntry | undefined>;
 }
 
-type BotWithPathfinder = mineflayer.Bot & {
+export type BotWithPathfinder = mineflayer.Bot & {
   pathfinder: PathfinderApi;
   registry: mineflayer.Bot['registry'] & RegistryLookup;
 };
