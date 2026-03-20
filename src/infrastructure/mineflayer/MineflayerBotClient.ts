@@ -53,6 +53,9 @@ export class MineflayerBotClient implements BotClient {
       username: configuration.username,
       version: configuration.version,
       auth: configuration.auth,
+      plugins: {
+        physics: false,
+      },
     }) as BotWithClient;
     const authenticator = new LightAuthBotAuthenticator(logger);
     let hasSpawned = false;
@@ -228,7 +231,7 @@ export class MineflayerBotClient implements BotClient {
     }
 
     logger.warn('Chat was blocked before movement. Walking briefly and retrying greeting.');
-    await this.walkForward(bot, 1200);
+    await this.nudgeForward(bot);
     await this.delay(400);
     bot.chat('hi');
     logger.info('Retried chat message "hi" after movement.');
@@ -269,10 +272,32 @@ export class MineflayerBotClient implements BotClient {
     });
   }
 
-  private async walkForward(bot: BotWithClient, durationMs: number): Promise<void> {
-    bot.setControlState('forward', true);
-    await this.delay(durationMs);
-    bot.setControlState('forward', false);
+  private async nudgeForward(bot: BotWithClient): Promise<void> {
+    if (!bot.entity) {
+      return;
+    }
+
+    const start = bot.entity.position.clone();
+    const yaw = bot.entity.yaw;
+    const stepDistance = 0.3;
+    const movedPosition = start.offset(-Math.sin(yaw) * stepDistance, 0, -Math.cos(yaw) * stepDistance);
+
+    this.sendPositionPacket(bot, movedPosition, true);
+    await this.delay(300);
+    this.sendPositionPacket(bot, start, true);
+  }
+
+  private sendPositionPacket(bot: BotWithClient, position: { x: number; y: number; z: number }, onGround: boolean): void {
+    bot._client.write('position', {
+      x: position.x,
+      y: position.y,
+      z: position.z,
+      onGround,
+      flags: {
+        onGround,
+        hasHorizontalCollision: undefined,
+      },
+    });
   }
 
   private parseInteger(value: string | undefined, fallback: number): number {
