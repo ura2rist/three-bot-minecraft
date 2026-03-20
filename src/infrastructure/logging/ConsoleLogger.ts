@@ -1,6 +1,10 @@
+import { appendFileSync, mkdirSync } from 'node:fs';
+import { dirname, resolve } from 'node:path';
 import { LogEntry, LogLevel, Logger } from '../../application/shared/ports/Logger';
 
 export class ConsoleLogger implements Logger {
+  private readonly logFilePath = this.resolveLogFilePath(process.env.LOG_FILE_PATH);
+
   constructor(
     private readonly entries: LogEntry[] = [],
     private readonly context?: string,
@@ -44,6 +48,7 @@ export class ConsoleLogger implements Logger {
       .join(' ');
 
     const output = `${prefix} ${message}`;
+    this.writeToFile(output, entry.error);
 
     if (level === 'error') {
       console.error(output);
@@ -81,5 +86,22 @@ export class ConsoleLogger implements Logger {
     } catch {
       return String(error);
     }
+  }
+
+  private resolveLogFilePath(logFilePath: string | undefined): string {
+    const resolvedPath = resolve(process.cwd(), logFilePath ?? 'logs/app.log');
+
+    mkdirSync(dirname(resolvedPath), { recursive: true });
+    return resolvedPath;
+  }
+
+  private writeToFile(message: string, error?: string): void {
+    appendFileSync(this.logFilePath, `${message}\n`, 'utf8');
+
+    if (!error) {
+      return;
+    }
+
+    appendFileSync(this.logFilePath, `${error}\n`, 'utf8');
   }
 }

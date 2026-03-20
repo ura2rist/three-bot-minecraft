@@ -183,8 +183,10 @@ BOT_CONNECT_MAX_RETRIES=2
 - `BOT_LOGIN_TIMEOUT_MS` - сколько ждать сетевой `login` от сервера.
 - `BOT_SPAWN_TIMEOUT_MS` - сколько ждать `spawn` после успешной авторизации.
 - `BOT_START_DELAY_MS` - пауза между стартом разных ботов, чтобы не упереться в server throttle.
+- `BOT_CONFIGURATION_FALLBACK_DELAY_MS` - через сколько миллисекунд попытаться дожать configuration-handshake fallback-пакетами, если сервер не перевёл клиента в `play`.
 - `BOT_CONNECT_RETRY_DELAY_MS` - пауза перед повторной попыткой после `Connection throttled`.
 - `BOT_CONNECT_MAX_RETRIES` - сколько раз повторять попытку подключения при throttle.
+- `LOG_FILE_PATH` - путь до файла общего логгера. По умолчанию `./logs/app.log`.
 - `LIGHTAUTH_REGISTER_COMMAND` - команда регистрации, по умолчанию `/register`.
 - `LIGHTAUTH_LOGIN_COMMAND` - команда логина, по умолчанию `/login`.
 - `LIGHTAUTH_COMMAND_DELAY_MS` - задержка между auth-командами.
@@ -198,6 +200,12 @@ BOT_CONNECT_MAX_RETRIES=2
 - хранит общую историю записей в памяти
 - поддерживает контекст по роли бота
 - пишет ошибки подключения, регистрации, логина и таймаутов авторизации
+
+Логи пишутся:
+
+- в консоль процесса
+- в файл `logs/app.log` по умолчанию
+- путь можно переопределить через `LOG_FILE_PATH`
 
 Это зафиксировано в [src/infrastructure/logging/ConsoleLogger.ts](src/infrastructure/logging/ConsoleLogger.ts) и [src/application/shared/ports/Logger.ts](src/application/shared/ports/Logger.ts).
 

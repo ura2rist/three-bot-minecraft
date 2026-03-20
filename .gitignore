@@ -6,3 +6,4 @@ AGENTS.md
 bots.config.json
 .idea/
 *.iml
+logs/

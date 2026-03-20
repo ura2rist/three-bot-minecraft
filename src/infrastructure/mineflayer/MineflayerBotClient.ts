@@ -15,6 +15,10 @@ export class MineflayerBotClient implements BotClient {
   private readonly rallyVerticalTolerance = 1.5;
   private readonly rallyTimeoutMs = this.parseInteger(process.env.BOT_RALLY_TIMEOUT_MS, 120000);
   private readonly movementControlTickMs = 100;
+  private readonly configurationFallbackDelayMs = this.parseInteger(
+    process.env.BOT_CONFIGURATION_FALLBACK_DELAY_MS,
+    1500,
+  );
   private readonly loginTimeoutMs = this.parseInteger(process.env.BOT_LOGIN_TIMEOUT_MS, 20000);
   private readonly spawnTimeoutMs = this.parseInteger(process.env.BOT_SPAWN_TIMEOUT_MS, 20000);
   private readonly retryDelayMs = this.parseInteger(process.env.BOT_CONNECT_RETRY_DELAY_MS, 7000);
@@ -62,6 +66,7 @@ export class MineflayerBotClient implements BotClient {
     const authenticator = new LightAuthBotAuthenticator(logger);
     let hasSpawned = false;
     let configurationSettingsSent = false;
+    let configurationFallbackTriggered = false;
 
     const sendConfigurationSettings = () => {
       if (configurationSettingsSent || bot._client.state !== 'configuration') {
@@ -114,10 +119,42 @@ export class MineflayerBotClient implements BotClient {
     bot._client.on('success', () => {
       logger.info('Low-level login success packet received.');
       setTimeout(sendConfigurationSettings, 0);
+      setTimeout(() => {
+        if (bot._client.state !== 'configuration' || configurationFallbackTriggered) {
+          return;
+        }
+
+        configurationFallbackTriggered = true;
+        logger.warn(
+          `Client is still in configuration after ${this.configurationFallbackDelayMs}ms. Sending fallback handshake packets.`,
+        );
+        this.tryWriteConfigurationPacket(bot, 'finish_configuration', logger);
+        this.tryWriteConfigurationPacket(bot, 'accept_code_of_conduct', logger);
+      }, this.configurationFallbackDelayMs);
     });
 
     bot._client.on('compress', () => {
       logger.info('Compression packet received.');
+    });
+
+    bot._client.on('keep_alive', () => {
+      logger.info(`Keep-alive packet received in state "${String(bot._client.state)}".`);
+    });
+
+    bot._client.on('registry_data', () => {
+      logger.info('Registry data packet received.');
+    });
+
+    bot._client.on('feature_flags', () => {
+      logger.info('Feature flags packet received.');
+    });
+
+    bot._client.on('code_of_conduct', () => {
+      logger.info('Code of conduct packet received.');
+    });
+
+    bot._client.on('show_dialog', () => {
+      logger.info('Show dialog packet received.');
     });
 
     bot._client.on('finish_configuration', () => {
@@ -396,6 +433,21 @@ export class MineflayerBotClient implements BotClient {
     });
   }
 
+  private tryWriteConfigurationPacket(
+    bot: BotWithClient,
+    packetName: 'finish_configuration' | 'accept_code_of_conduct',
+    logger: Logger,
+  ): void {
+    try {
+      bot._client.write(packetName, {});
+      logger.info(`Fallback packet sent: ${packetName}.`);
+    } catch (error) {
+      logger.warn(
+        `Failed to send fallback packet "${packetName}" while in state "${String(bot._client.state)}": ${this.stringifyError(error)}`,
+      );
+    }
+  }
+
   private normalizeAngle(angle: number): number {
     let normalized = angle;
 
@@ -422,5 +474,13 @@ export class MineflayerBotClient implements BotClient {
 
   private async delay(ms: number): Promise<void> {
     await new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  private stringifyError(error: unknown): string {
+    if (error instanceof Error) {
+      return error.message;
+    }
+
+    return String(error);
   }
 }
