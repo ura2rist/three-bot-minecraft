@@ -182,10 +182,14 @@ export class MineflayerBotClient implements BotClient {
         await this.waitForSpawn(bot, configuration);
       }
 
+      if (configuration.rallyPoint) {
+        void this.moveToRallyPoint(bot, configuration, logger).catch((error) => {
+          logger.error('Failed to reach the rally point after spawn.', error);
+        });
+        return;
+      }
+
       await this.sendGreeting(bot, logger);
-      void this.moveToRallyPoint(bot, configuration, logger).catch((error) => {
-        logger.error('Failed to reach the rally point after spawn.', error);
-      });
     } catch (error) {
       if (error instanceof Error && error.message.toLowerCase().includes('lightauth')) {
         logger.error('LightAuth authorization failed.', error);
@@ -324,6 +328,7 @@ export class MineflayerBotClient implements BotClient {
       `Heading to rally point ${configuration.rallyPoint.x} ${configuration.rallyPoint.y} ${configuration.rallyPoint.z}.`,
     );
 
+    this.primePhysicsMovement(bot, logger);
     bot.physicsEnabled = true;
     let lastYaw: number | null = null;
     let stalledTicks = 0;
@@ -363,6 +368,13 @@ export class MineflayerBotClient implements BotClient {
 
         const horizontalSpeed = Math.hypot(bot.entity.velocity.x, bot.entity.velocity.z);
         stalledTicks = horizontalSpeed < 0.02 ? stalledTicks + 1 : 0;
+
+        if (stalledTicks > 0 && stalledTicks % 20 === 0) {
+          logger.warn(
+            `Bot is stalled while moving to rally point. Current position: ${currentPosition.x.toFixed(2)} ${currentPosition.y.toFixed(2)} ${currentPosition.z.toFixed(2)}.`,
+          );
+          this.primePhysicsMovement(bot, logger);
+        }
 
         bot.setControlState('forward', true);
         bot.setControlState('sprint', horizontalDistance > 6);
@@ -441,6 +453,32 @@ export class MineflayerBotClient implements BotClient {
         hasHorizontalCollision: undefined,
       },
     });
+  }
+
+  private primePhysicsMovement(bot: BotWithClient, logger: Logger): void {
+    if (!bot.entity) {
+      return;
+    }
+
+    const flags = {
+      x: false,
+      y: false,
+      z: false,
+      yaw: false,
+      pitch: false,
+    };
+
+    bot._client.emit('position', {
+      x: bot.entity.position.x,
+      y: bot.entity.position.y,
+      z: bot.entity.position.z,
+      yaw: bot.entity.yaw,
+      pitch: bot.entity.pitch,
+      flags,
+      teleportId: 0,
+    });
+
+    logger.info('Primed physics movement from the current bot position.');
   }
 
   private tryWriteConfigurationPacket(
