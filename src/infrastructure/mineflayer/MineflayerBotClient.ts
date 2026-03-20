@@ -45,6 +45,11 @@ type BotWithClient = mineflayer.Bot & {
 export class MineflayerBotClient implements BotClient {
   private readonly rallyGoalRange = 1;
   private readonly rallyTimeoutMs = this.parseInteger(process.env.BOT_RALLY_TIMEOUT_MS, 120000);
+  private readonly rallyRetryDelayMs = this.parseInteger(process.env.BOT_RALLY_RETRY_DELAY_MS, 3000);
+  private readonly rallySingleAttemptTimeoutMs = this.parseInteger(
+    process.env.BOT_RALLY_SINGLE_ATTEMPT_TIMEOUT_MS,
+    15000,
+  );
   private readonly configurationFallbackDelayMs = this.parseInteger(
     process.env.BOT_CONFIGURATION_FALLBACK_DELAY_MS,
     1500,
@@ -162,7 +167,6 @@ export class MineflayerBotClient implements BotClient {
         })
         .catch((error) => {
           if (attempt !== rallyNavigationAttempt) {
-            logger.info('Ignored an outdated rally navigation result.');
             return;
           }
 
@@ -275,6 +279,10 @@ export class MineflayerBotClient implements BotClient {
     // });
 
     stringEventBot.on('path_reset', (reason) => {
+      if (reason === 'chunk_loaded' || reason === 'stuck') {
+        return;
+      }
+
       logger.warn(`Pathfinder reset the path: ${reason}.`);
     });
 
@@ -405,6 +413,22 @@ export class MineflayerBotClient implements BotClient {
     );
   }
 
+  private isRetryableRallyNavigationError(error: unknown): boolean {
+    if (!(error instanceof Error)) {
+      return false;
+    }
+
+    const message = error.message.toLowerCase();
+
+    return (
+      message.includes('no path to the goal') ||
+      message.includes('timed out') ||
+      message.includes('stuck') ||
+      message.includes('goal changed') ||
+      message.includes('path stopped')
+    );
+  }
+
   private formatDisconnectReason(bot: BotWithClient): string {
     if (!bot._client._lastDisconnectReason) {
       return '';
@@ -450,34 +474,59 @@ export class MineflayerBotClient implements BotClient {
     );
 
     const movements = this.createRallyMovements(bot);
-    bot.pathfinder.setMovements(movements);
+    const deadline = Date.now() + this.rallyTimeoutMs;
 
-    try {
-      await Promise.race([
-        bot.pathfinder.goto(
-          new GoalNear(
-            configuration.rallyPoint.x,
-            configuration.rallyPoint.y,
-            configuration.rallyPoint.z,
-            this.rallyGoalRange,
+    while (Date.now() < deadline) {
+      bot.pathfinder.setMovements(movements);
+
+      try {
+        await bot.waitForChunksToLoad();
+
+        const attemptTimeoutMs = Math.min(
+          this.rallySingleAttemptTimeoutMs,
+          Math.max(deadline - Date.now(), 1000),
+        );
+
+        await Promise.race([
+          bot.pathfinder.goto(
+            new GoalNear(
+              configuration.rallyPoint.x,
+              configuration.rallyPoint.y,
+              configuration.rallyPoint.z,
+              this.rallyGoalRange,
+            ),
           ),
-        ),
-        this.failAfter(
-          this.rallyTimeoutMs,
-          `Timed out after ${this.rallyTimeoutMs}ms before reaching ${configuration.rallyPoint.x} ${configuration.rallyPoint.y} ${configuration.rallyPoint.z}.`,
-        ),
-      ]);
+          this.failAfter(
+            attemptTimeoutMs,
+            `Timed out after ${attemptTimeoutMs}ms while building or following a route to ${configuration.rallyPoint.x} ${configuration.rallyPoint.y} ${configuration.rallyPoint.z}.`,
+          ),
+        ]);
 
-      if (!bot.entity) {
-        throw new Error('Bot entity is unavailable after pathfinding completed.');
+        if (!bot.entity) {
+          throw new Error('Bot entity is unavailable after pathfinding completed.');
+        }
+
+        logger.info(
+          `Reached rally point at ${bot.entity.position.x.toFixed(2)} ${bot.entity.position.y.toFixed(2)} ${bot.entity.position.z.toFixed(2)}.`,
+        );
+        return;
+      } catch (error) {
+        if (!this.isRetryableRallyNavigationError(error) || Date.now() + this.rallyRetryDelayMs >= deadline) {
+          throw error;
+        }
+
+        logger.warn(
+          `Could not reach the rally point yet. Retrying in ${this.rallyRetryDelayMs}ms: ${this.stringifyError(error)}.`,
+        );
+        await this.delay(this.rallyRetryDelayMs);
+      } finally {
+        bot.pathfinder.stop();
       }
-
-      logger.info(
-        `Reached rally point at ${bot.entity.position.x.toFixed(2)} ${bot.entity.position.y.toFixed(2)} ${bot.entity.position.z.toFixed(2)}.`,
-      );
-    } finally {
-      bot.pathfinder.stop();
     }
+
+    throw new Error(
+      `Timed out after ${this.rallyTimeoutMs}ms before reaching ${configuration.rallyPoint.x} ${configuration.rallyPoint.y} ${configuration.rallyPoint.z}.`,
+    );
   }
 
   private waitForChatBlockMessage(bot: BotWithClient, timeoutMs: number): Promise<boolean> {
