@@ -15,8 +15,16 @@ const GoalNear = mineflayerPathfinder.goals.GoalNear as new (
   z: number,
   range: number,
 ) => unknown;
+const GoalNearXZ = mineflayerPathfinder.goals.GoalNearXZ as new (
+  x: number,
+  z: number,
+  range: number,
+) => unknown;
 
 interface PathfinderApi {
+  thinkTimeout: number;
+  tickTimeout: number;
+  searchRadius?: number;
   setMovements(movements: PathfinderMovements): void;
   goto(goal: unknown): Promise<void>;
   stop(): void;
@@ -48,6 +56,11 @@ export class MineflayerBotClient implements BotClient {
     process.env.BOT_RALLY_MOVE_DISTANCE_THRESHOLD,
     50,
   );
+  private readonly rallyStepDistance = this.parseInteger(process.env.BOT_RALLY_STEP_DISTANCE, 40);
+  private readonly rallyHorizontalGoalRange = this.parseInteger(
+    process.env.BOT_RALLY_HORIZONTAL_GOAL_RANGE,
+    3,
+  );
   private readonly rallyTimeoutMs = this.parseInteger(process.env.BOT_RALLY_TIMEOUT_MS, 120000);
   private readonly rallyRetryDelayMs = this.parseInteger(process.env.BOT_RALLY_RETRY_DELAY_MS, 3000);
   private readonly rallySingleAttemptTimeoutMs = this.parseInteger(
@@ -66,8 +79,20 @@ export class MineflayerBotClient implements BotClient {
   private readonly spawnTimeoutMs = this.parseInteger(process.env.BOT_SPAWN_TIMEOUT_MS, 20000);
   private readonly retryDelayMs = this.parseInteger(process.env.BOT_CONNECT_RETRY_DELAY_MS, 7000);
   private readonly maxRetries = this.parseInteger(process.env.BOT_CONNECT_MAX_RETRIES, 2);
+  private readonly reconnectDelayMs = this.parseInteger(process.env.BOT_RECONNECT_DELAY_MS, 5000);
+  private readonly pathfinderThinkTimeoutMs = this.parseInteger(
+    process.env.BOT_PATHFINDER_THINK_TIMEOUT_MS,
+    3000,
+  );
+  private readonly pathfinderTickTimeoutMs = this.parseInteger(
+    process.env.BOT_PATHFINDER_TICK_TIMEOUT_MS,
+    15,
+  );
   private readonly craftingTableCoordinator = new CraftingTableCoordinator();
   private readonly craftingTableProvisioner = new CraftingTableProvisioner(this.craftingTableCoordinator);
+  private readonly supervisedBots = new Set<string>();
+  private readonly reconnectTimers = new Map<string, NodeJS.Timeout>();
+  private readonly reconnectingBots = new Set<string>();
 
   constructor(private readonly logger: Logger) {}
 
@@ -88,11 +113,28 @@ export class MineflayerBotClient implements BotClient {
   }
 
   async connect(configuration: BotConfiguration): Promise<void> {
+    this.supervisedBots.add(this.getBotKey(configuration));
+    await this.connectWithRetries(configuration, false);
+  }
+
+  private async connectWithRetries(
+    configuration: BotConfiguration,
+    isReconnectAttempt: boolean,
+  ): Promise<void> {
     let attempt = 0;
+    const botKey = this.getBotKey(configuration);
+
+    this.clearReconnectTimer(botKey);
 
     while (attempt <= this.maxRetries) {
       try {
         await this.connectOnce(configuration);
+        if (isReconnectAttempt) {
+          this.logger
+            .child(configuration.role)
+            .info(`Bot "${configuration.username}" reconnected successfully.`);
+        }
+
         return;
       } catch (error) {
         const isLastAttempt = attempt >= this.maxRetries;
@@ -124,10 +166,14 @@ export class MineflayerBotClient implements BotClient {
       auth: configuration.auth,
     }) as BotWithClient;
     bot.loadPlugin(pathfinderPlugin);
+    bot.pathfinder.thinkTimeout = this.pathfinderThinkTimeoutMs;
+    bot.pathfinder.tickTimeout = this.pathfinderTickTimeoutMs;
 
     const authenticator = new LightAuthBotAuthenticator(logger);
     let hasSpawned = false;
     let isAuthenticated = false;
+    let startupCompleted = false;
+    let reconnectScheduled = false;
     let spawnCount = 0;
     let configurationSettingsSent = false;
     let configurationFallbackTriggered = false;
@@ -152,6 +198,14 @@ export class MineflayerBotClient implements BotClient {
       rallyNavigationPromise = null;
       bot.pathfinder.stop();
       logger.info(`Stopped rally navigation: ${reason}.`);
+    };
+    const scheduleReconnect = (reason: string) => {
+      if (!startupCompleted || reconnectScheduled) {
+        return;
+      }
+
+      reconnectScheduled = true;
+      this.scheduleReconnect(configuration, logger, reason);
     };
     const startRallyNavigation = (force = false) => {
       if (!configuration.rallyPoint) {
@@ -305,14 +359,17 @@ export class MineflayerBotClient implements BotClient {
 
     bot.on('end', (reason) => {
       logger.info(`Bot connection ended: ${reason ?? 'unknown reason'}`);
+      scheduleReconnect(`connection ended: ${reason ?? 'unknown reason'}`);
     });
 
     bot.on('kicked', (reason) => {
       logger.error(`Bot was kicked: ${String(reason)}`);
+      scheduleReconnect(`bot was kicked: ${this.stringifyError(reason)}`);
     });
 
     bot.on('error', (error) => {
       logger.error('Mineflayer client error.', error);
+      scheduleReconnect(`client error: ${error.message}`);
     });
 
     try {
@@ -326,10 +383,12 @@ export class MineflayerBotClient implements BotClient {
       }
 
       if (configuration.rallyPoint) {
+        startupCompleted = true;
         startRallyNavigation();
         return;
       }
 
+      startupCompleted = true;
       await this.sendGreeting(bot, logger);
     } catch (error) {
       if (error instanceof Error && error.message.toLowerCase().includes('lightauth')) {
@@ -421,7 +480,10 @@ export class MineflayerBotClient implements BotClient {
       message.includes('timed out') ||
       message.includes('econnreset') ||
       message.includes('socketclosed') ||
-      message.includes('keepaliveerror')
+      message.includes('keepaliveerror') ||
+      message.includes('client timed out') ||
+      message.includes('write econnreset') ||
+      message.includes('socket closed')
     );
   }
 
@@ -504,16 +566,10 @@ export class MineflayerBotClient implements BotClient {
           this.rallySingleAttemptTimeoutMs,
           Math.max(deadline - Date.now(), 1000),
         );
+        const goal = this.createNextRallyGoal(bot, configuration);
 
         await Promise.race([
-          bot.pathfinder.goto(
-            new GoalNear(
-              configuration.rallyPoint.x,
-              configuration.rallyPoint.y,
-              configuration.rallyPoint.z,
-              this.rallyGoalRange,
-            ),
-          ),
+          bot.pathfinder.goto(goal),
           this.failAfter(
             attemptTimeoutMs,
             `Timed out after ${attemptTimeoutMs}ms while building or following a route to ${configuration.rallyPoint.x} ${configuration.rallyPoint.y} ${configuration.rallyPoint.z}.`,
@@ -575,6 +631,41 @@ export class MineflayerBotClient implements BotClient {
     const dz = bot.entity.position.z - configuration.rallyPoint.z;
 
     return Math.sqrt(dx * dx + dy * dy + dz * dz);
+  }
+
+  private calculateHorizontalDistanceToGoal(bot: BotWithClient, configuration: BotConfiguration): number {
+    if (!bot.entity || !configuration.rallyPoint) {
+      return Number.POSITIVE_INFINITY;
+    }
+
+    const dx = bot.entity.position.x - configuration.rallyPoint.x;
+    const dz = bot.entity.position.z - configuration.rallyPoint.z;
+
+    return Math.sqrt(dx * dx + dz * dz);
+  }
+
+  private createNextRallyGoal(bot: BotWithClient, configuration: BotConfiguration): unknown {
+    if (!bot.entity || !configuration.rallyPoint) {
+      throw new Error('Cannot build a rally goal without an entity and rally point.');
+    }
+
+    const currentPosition = bot.entity.position;
+    const target = configuration.rallyPoint;
+    const horizontalDistance = this.calculateHorizontalDistanceToGoal(bot, configuration);
+
+    if (horizontalDistance <= this.rallyStepDistance) {
+      return new GoalNear(target.x, target.y, target.z, this.rallyGoalRange);
+    }
+
+    const ratio = this.rallyStepDistance / horizontalDistance;
+    const stepX = currentPosition.x + (target.x - currentPosition.x) * ratio;
+    const stepZ = currentPosition.z + (target.z - currentPosition.z) * ratio;
+
+    return new GoalNearXZ(
+      Math.round(stepX),
+      Math.round(stepZ),
+      this.rallyHorizontalGoalRange,
+    );
   }
 
   private shouldMoveToRallyPoint(
@@ -663,13 +754,56 @@ export class MineflayerBotClient implements BotClient {
 
   private createRallyMovements(bot: BotWithClient): PathfinderMovements {
     const movements = new Movements(bot);
-    movements.canDig = true;
+    movements.canDig = false;
     movements.allow1by1towers = false;
     movements.allowParkour = true;
     movements.allowSprinting = true;
     movements.canOpenDoors = true;
-    movements.maxDropDown = 8;
+    movements.maxDropDown = 4;
     return movements;
+  }
+
+  private getBotKey(configuration: BotConfiguration): string {
+    return `${configuration.role}:${configuration.username}`;
+  }
+
+  private clearReconnectTimer(botKey: string): void {
+    const timer = this.reconnectTimers.get(botKey);
+
+    if (!timer) {
+      return;
+    }
+
+    clearTimeout(timer);
+    this.reconnectTimers.delete(botKey);
+  }
+
+  private scheduleReconnect(configuration: BotConfiguration, logger: Logger, reason: string): void {
+    const botKey = this.getBotKey(configuration);
+
+    if (!this.supervisedBots.has(botKey) || this.reconnectTimers.has(botKey) || this.reconnectingBots.has(botKey)) {
+      return;
+    }
+
+    logger.warn(
+      `Bot "${configuration.username}" will reconnect in ${this.reconnectDelayMs}ms because ${reason}.`,
+    );
+
+    const timer = setTimeout(() => {
+      this.reconnectTimers.delete(botKey);
+      this.reconnectingBots.add(botKey);
+
+      void this.connectWithRetries(configuration, true)
+        .catch((error) => {
+          logger.error(`Reconnect attempt failed for "${configuration.username}".`, error);
+          this.scheduleReconnect(configuration, logger, 'the previous reconnect attempt failed');
+        })
+        .finally(() => {
+          this.reconnectingBots.delete(botKey);
+        });
+    }, this.reconnectDelayMs);
+
+    this.reconnectTimers.set(botKey, timer);
   }
 
   private tryWriteConfigurationPacket(
