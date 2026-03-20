@@ -40,7 +40,7 @@ export class MineflayerBotClient implements BotClient {
   private readonly rallyGoalRange = 1;
   private readonly rallyMinDistanceToMove = this.parseInteger(
     process.env.BOT_RALLY_MOVE_DISTANCE_THRESHOLD,
-    50,
+    5,
   );
   private readonly rallyStepDistance = this.parseInteger(process.env.BOT_RALLY_STEP_DISTANCE, 40);
   private readonly rallyHorizontalGoalRange = this.parseInteger(
@@ -233,7 +233,11 @@ export class MineflayerBotClient implements BotClient {
             logger,
           );
 
-          await ensureCraftingTableService.execute(configuration);
+          try {
+            await ensureCraftingTableService.execute(configuration);
+          } catch (error) {
+            logger.error('Failed to ensure a crafting table near the rally point.', error);
+          }
         })
         .catch((error) => {
           if (attempt !== rallyNavigationAttempt) {
