@@ -1,11 +1,14 @@
 import mineflayer from 'mineflayer';
 import { BotClient } from '../../application/bot/ports/BotClient';
+import { EnsureCraftingTableNearRallyPointService } from '../../application/bot/services/EnsureCraftingTableNearRallyPointService';
+import { RandomCraftingTableAssignmentPolicy } from '../../application/bot/services/RandomCraftingTableAssignmentPolicy';
 import { BotConfiguration } from '../../domain/bot/entities/BotConfiguration';
 import { Logger } from '../../application/shared/ports/Logger';
 import { LightAuthBotAuthenticator } from './LightAuthBotAuthenticator';
-import { CraftingTableCoordinator } from './CraftingTableCoordinator';
-import { CraftingTableProvisioner } from './CraftingTableProvisioner';
-import type { BotWithPathfinder } from './CraftingTableProvisioner';
+import { MineflayerCraftingTablePlacementPort } from './MineflayerCraftingTablePlacementPort';
+import { MineflayerItemCraftingPort } from './MineflayerItemCraftingPort';
+import { MineflayerLogHarvestingPort } from './MineflayerLogHarvestingPort';
+import type { BotWithPathfinder, PathfinderApi, PathfinderMovements } from './MineflayerPortsShared';
 
 const mineflayerPathfinder = require('../../../.vendor/mineflayer-pathfinder-master');
 const pathfinderPlugin = mineflayerPathfinder.pathfinder as (bot: mineflayer.Bot) => void;
@@ -21,24 +24,6 @@ const GoalNearXZ = mineflayerPathfinder.goals.GoalNearXZ as new (
   z: number,
   range: number,
 ) => unknown;
-
-interface PathfinderApi {
-  thinkTimeout: number;
-  tickTimeout: number;
-  searchRadius?: number;
-  setMovements(movements: PathfinderMovements): void;
-  goto(goal: unknown): Promise<void>;
-  stop(): void;
-}
-
-interface PathfinderMovements {
-  canDig: boolean;
-  allow1by1towers: boolean;
-  allowParkour: boolean;
-  allowSprinting: boolean;
-  canOpenDoors: boolean;
-  maxDropDown: number;
-}
 
 interface StringEventBot {
   on(event: string, listener: (...args: unknown[]) => void): void;
@@ -89,8 +74,7 @@ export class MineflayerBotClient implements BotClient {
     process.env.BOT_PATHFINDER_TICK_TIMEOUT_MS,
     15,
   );
-  private readonly craftingTableCoordinator = new CraftingTableCoordinator();
-  private readonly craftingTableProvisioner = new CraftingTableProvisioner(this.craftingTableCoordinator);
+  private readonly craftingTableAssignmentPolicy = new RandomCraftingTableAssignmentPolicy();
   private readonly supervisedBots = new Set<string>();
   private readonly reconnectTimers = new Map<string, NodeJS.Timeout>();
   private readonly reconnectingBots = new Set<string>();
@@ -98,10 +82,10 @@ export class MineflayerBotClient implements BotClient {
   constructor(private readonly logger: Logger) {}
 
   prepareFleet(configurations: readonly BotConfiguration[]): void {
-    this.craftingTableCoordinator.prepareFleet(configurations);
+    this.craftingTableAssignmentPolicy.prepareFleet(configurations);
 
     for (const configuration of configurations) {
-      const assignedUsername = this.craftingTableCoordinator.getAssignedUsername(configuration);
+      const assignedUsername = this.craftingTableAssignmentPolicy.getAssignedUsername(configuration);
 
       if (!assignedUsername || !configuration.rallyPoint || assignedUsername !== configuration.username) {
         continue;
@@ -236,11 +220,20 @@ export class MineflayerBotClient implements BotClient {
 
       rallyNavigationPromise = this.moveToRallyPoint(bot, configuration, logger)
         .then(async () => {
-          await this.craftingTableProvisioner.ensureNearRallyPoint(
-            this.requirePathfinderBot(bot),
-            configuration,
+          const pathfinderBot = this.requirePathfinderBot(bot);
+          const ensureCraftingTableService = new EnsureCraftingTableNearRallyPointService(
+            this.craftingTableAssignmentPolicy,
+            new MineflayerCraftingTablePlacementPort(pathfinderBot, logger, (target, range) =>
+              this.gotoPosition(pathfinderBot, target, range),
+            ),
+            new MineflayerItemCraftingPort(pathfinderBot, logger),
+            new MineflayerLogHarvestingPort(pathfinderBot, logger, (target, range) =>
+              this.gotoPosition(pathfinderBot, target, range),
+            ),
             logger,
           );
+
+          await ensureCraftingTableService.execute(configuration);
         })
         .catch((error) => {
           if (attempt !== rallyNavigationAttempt) {
@@ -781,6 +774,12 @@ export class MineflayerBotClient implements BotClient {
     movements.canOpenDoors = true;
     movements.maxDropDown = 4;
     return movements;
+  }
+
+  private async gotoPosition(bot: BotWithPathfinder, target: { x: number; y: number; z: number }, range: number): Promise<void> {
+    bot.pathfinder.setMovements(this.createRallyMovements(bot));
+    await bot.pathfinder.goto(new GoalNear(target.x, target.y, target.z, range));
+    bot.pathfinder.stop();
   }
 
   private requirePathfinderBot(bot: BotWithClient): BotWithPathfinder {

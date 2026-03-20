@@ -1,6 +1,7 @@
-import { BotConfiguration } from '../../domain/bot/entities/BotConfiguration';
+import { BotConfiguration } from '../../../domain/bot/entities/BotConfiguration';
+import { CraftingTableAssignmentPolicy } from '../ports/CraftingTableAssignmentPolicy';
 
-export class CraftingTableCoordinator {
+export class RandomCraftingTableAssignmentPolicy implements CraftingTableAssignmentPolicy {
   private readonly assignments = new Map<string, string>();
 
   prepareFleet(configurations: readonly BotConfiguration[]): void {
@@ -14,10 +15,6 @@ export class CraftingTableCoordinator {
       }
 
       const rallyKey = this.getRallyKey(configuration);
-
-      if (!rallyKey) {
-        continue;
-      }
 
       if (!groupedConfigurations.has(rallyKey)) {
         groupedConfigurations.set(rallyKey, []);
@@ -33,13 +30,11 @@ export class CraftingTableCoordinator {
   }
 
   getAssignedUsername(configuration: BotConfiguration): string | undefined {
-    const rallyKey = this.getRallyKey(configuration);
-
-    if (!rallyKey) {
+    if (!configuration.rallyPoint) {
       return undefined;
     }
 
-    return this.assignments.get(rallyKey);
+    return this.assignments.get(this.getRallyKey(configuration));
   }
 
   isAssignedCrafter(configuration: BotConfiguration): boolean {
@@ -47,11 +42,7 @@ export class CraftingTableCoordinator {
     return assignedUsername === undefined || assignedUsername === configuration.username;
   }
 
-  private getRallyKey(configuration: BotConfiguration): string | undefined {
-    if (!configuration.rallyPoint) {
-      return undefined;
-    }
-
-    return `${configuration.rallyPoint.x}:${configuration.rallyPoint.y}:${configuration.rallyPoint.z}`;
+  private getRallyKey(configuration: BotConfiguration): string {
+    return `${configuration.rallyPoint?.x}:${configuration.rallyPoint?.y}:${configuration.rallyPoint?.z}`;
   }
 }
