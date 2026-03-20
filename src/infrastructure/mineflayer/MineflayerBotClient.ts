@@ -129,8 +129,7 @@ export class MineflayerBotClient implements BotClient {
       await this.waitForSpawn(bot, configuration);
     }
 
-    bot.chat('hi');
-    logger.info('Sent chat message "hi".');
+    await this.sendGreeting(bot, logger);
   }
 
   private waitForLogin(bot: BotWithClient, configuration: BotConfiguration): Promise<void> {
@@ -216,6 +215,64 @@ export class MineflayerBotClient implements BotClient {
     }
 
     return ` Disconnect reason: ${bot._client._lastDisconnectReason}`;
+  }
+
+  private async sendGreeting(bot: BotWithClient, logger: Logger): Promise<void> {
+    bot.chat('hi');
+    logger.info('Sent chat message "hi".');
+
+    const chatWasBlocked = await this.waitForChatBlockMessage(bot, 2000);
+
+    if (!chatWasBlocked) {
+      return;
+    }
+
+    logger.warn('Chat was blocked before movement. Walking briefly and retrying greeting.');
+    await this.walkForward(bot, 1200);
+    await this.delay(400);
+    bot.chat('hi');
+    logger.info('Retried chat message "hi" after movement.');
+  }
+
+  private waitForChatBlockMessage(bot: BotWithClient, timeoutMs: number): Promise<boolean> {
+    const patterns = [
+      'нужно немного пройтись',
+      'не можете выполнить это действие',
+      'не можете писать в чат',
+      'muted pre-movement chat',
+      'need to walk',
+    ];
+
+    return new Promise((resolve) => {
+      const timeoutId = setTimeout(() => {
+        cleanup();
+        resolve(false);
+      }, timeoutMs);
+
+      const handler = (message: string) => {
+        const normalized = message.replace(/\u00A7./g, '').trim().toLowerCase();
+
+        if (!patterns.some((pattern) => normalized.includes(pattern))) {
+          return;
+        }
+
+        cleanup();
+        resolve(true);
+      };
+
+      const cleanup = () => {
+        clearTimeout(timeoutId);
+        bot.off('messagestr', handler);
+      };
+
+      bot.on('messagestr', handler);
+    });
+  }
+
+  private async walkForward(bot: BotWithClient, durationMs: number): Promise<void> {
+    bot.setControlState('forward', true);
+    await this.delay(durationMs);
+    bot.setControlState('forward', false);
   }
 
   private parseInteger(value: string | undefined, fallback: number): number {

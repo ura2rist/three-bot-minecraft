@@ -16,18 +16,27 @@ const REGISTER_MATCHER: MessageMatcher = {
     'registered successfully',
     'you have been registered',
     'registration successful',
+    'регистрация прошла успешно',
+    'теперь вы вошли в аккаунт',
   ],
   nonFatalPatterns: [
     'already registered',
     'already have an account',
     'please login',
     'use /login',
+    'вы уже зарегистрированы',
+    'уже зарегистрирован',
+    'используйте /login',
+    'войдите в аккаунт',
   ],
   failurePatterns: [
     'passwords do not match',
     'password too short',
     'password too weak',
     'registration failed',
+    'пароли не совпадают',
+    'пароль слишком короткий',
+    'регистрация не удалась',
   ],
 };
 
@@ -39,6 +48,9 @@ const LOGIN_MATCHER: MessageMatcher = {
     'authenticated',
     'you are now logged in',
     'already logged in',
+    'вы успешно вошли в аккаунт',
+    'успешно вошли в аккаунт',
+    'с возвращением',
   ],
   failurePatterns: [
     'wrong password',
@@ -46,6 +58,9 @@ const LOGIN_MATCHER: MessageMatcher = {
     'invalid password',
     'login failed',
     'not registered',
+    'неверный пароль',
+    'ошибка входа',
+    'вы не зарегистрированы',
   ],
 };
 
