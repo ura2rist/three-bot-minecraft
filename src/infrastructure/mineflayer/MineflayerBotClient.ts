@@ -61,6 +61,17 @@ export class MineflayerBotClient implements BotClient {
     }) as BotWithClient;
     const authenticator = new LightAuthBotAuthenticator(logger);
     let hasSpawned = false;
+    let configurationSettingsSent = false;
+
+    const sendConfigurationSettings = () => {
+      if (configurationSettingsSent || bot._client.state !== 'configuration') {
+        return;
+      }
+
+      bot.setSettings({});
+      configurationSettingsSent = true;
+      logger.info('Client settings packet sent during configuration phase.');
+    };
 
     bot._client.on('connect', () => {
       logger.info('TCP connection established.');
@@ -102,10 +113,15 @@ export class MineflayerBotClient implements BotClient {
 
     bot._client.on('success', () => {
       logger.info('Low-level login success packet received.');
+      setTimeout(sendConfigurationSettings, 0);
     });
 
     bot._client.on('compress', () => {
       logger.info('Compression packet received.');
+    });
+
+    bot._client.on('finish_configuration', () => {
+      logger.info('Finish configuration packet received.');
     });
 
     bot.on('end', (reason) => {
