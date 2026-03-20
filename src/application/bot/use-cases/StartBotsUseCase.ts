@@ -13,6 +13,7 @@ export class StartBotsUseCase {
   async execute(): Promise<void> {
     const fleetConfiguration = this.configurationProvider.load();
     const failures: unknown[] = [];
+    this.botClient.prepareFleet(fleetConfiguration.bots);
 
     for (let index = 0; index < fleetConfiguration.bots.length; index += 1) {
       const configuration = fleetConfiguration.bots[index];

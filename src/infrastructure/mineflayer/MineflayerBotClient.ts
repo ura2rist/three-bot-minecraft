@@ -3,6 +3,8 @@ import { BotClient } from '../../application/bot/ports/BotClient';
 import { BotConfiguration } from '../../domain/bot/entities/BotConfiguration';
 import { Logger } from '../../application/shared/ports/Logger';
 import { LightAuthBotAuthenticator } from './LightAuthBotAuthenticator';
+import { CraftingTableCoordinator } from './CraftingTableCoordinator';
+import { CraftingTableProvisioner } from './CraftingTableProvisioner';
 
 const mineflayerPathfinder = require('../../../.vendor/mineflayer-pathfinder-master');
 const pathfinderPlugin = mineflayerPathfinder.pathfinder as (bot: mineflayer.Bot) => void;
@@ -51,8 +53,26 @@ export class MineflayerBotClient implements BotClient {
   private readonly spawnTimeoutMs = this.parseInteger(process.env.BOT_SPAWN_TIMEOUT_MS, 20000);
   private readonly retryDelayMs = this.parseInteger(process.env.BOT_CONNECT_RETRY_DELAY_MS, 7000);
   private readonly maxRetries = this.parseInteger(process.env.BOT_CONNECT_MAX_RETRIES, 2);
+  private readonly craftingTableCoordinator = new CraftingTableCoordinator();
+  private readonly craftingTableProvisioner = new CraftingTableProvisioner(this.craftingTableCoordinator);
 
   constructor(private readonly logger: Logger) {}
+
+  prepareFleet(configurations: readonly BotConfiguration[]): void {
+    this.craftingTableCoordinator.prepareFleet(configurations);
+
+    for (const configuration of configurations) {
+      const assignedUsername = this.craftingTableCoordinator.getAssignedUsername(configuration);
+
+      if (!assignedUsername || !configuration.rallyPoint || assignedUsername !== configuration.username) {
+        continue;
+      }
+
+      this.logger.info(
+        `Crafting table provisioning near ${configuration.rallyPoint.x} ${configuration.rallyPoint.y} ${configuration.rallyPoint.z} is assigned to "${configuration.username}".`,
+      );
+    }
+  }
 
   async connect(configuration: BotConfiguration): Promise<void> {
     let attempt = 0;
@@ -137,6 +157,9 @@ export class MineflayerBotClient implements BotClient {
       rallyNavigationAttempt = attempt;
 
       rallyNavigationPromise = this.moveToRallyPoint(bot, configuration, logger)
+        .then(async () => {
+          await this.craftingTableProvisioner.ensureNearRallyPoint(bot, configuration, logger);
+        })
         .catch((error) => {
           if (attempt !== rallyNavigationAttempt) {
             logger.info('Ignored an outdated rally navigation result.');
