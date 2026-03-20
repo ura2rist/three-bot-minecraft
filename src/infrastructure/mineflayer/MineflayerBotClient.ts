@@ -36,14 +36,14 @@ export class MineflayerBotClient implements BotClient {
       } catch (error) {
         const isLastAttempt = attempt >= this.maxRetries;
 
-        if (!this.isConnectionThrottled(error) || isLastAttempt) {
+        if (!this.isRetryableConnectionError(error) || isLastAttempt) {
           throw error;
         }
 
         this.logger
           .child(configuration.role)
           .warn(
-            `Server throttled the connection. Retrying in ${this.retryDelayMs}ms (attempt ${attempt + 2}/${this.maxRetries + 1}).`,
+            `Bot startup failed with a retryable connection error. Retrying in ${this.retryDelayMs}ms (attempt ${attempt + 2}/${this.maxRetries + 1}).`,
           );
 
         await this.delay(this.retryDelayMs);
@@ -173,24 +173,27 @@ export class MineflayerBotClient implements BotClient {
       logger.error('Mineflayer client error.', error);
     });
 
-    await this.waitForLogin(bot, configuration);
-
     try {
+      await this.waitForLogin(bot, configuration);
+
       await authenticator.authenticate(bot, configuration);
+
+      if (!hasSpawned) {
+        await this.waitForSpawn(bot, configuration);
+      }
+
+      await this.sendGreeting(bot, logger);
+      void this.moveToRallyPoint(bot, configuration, logger).catch((error) => {
+        logger.error('Failed to reach the rally point after spawn.', error);
+      });
     } catch (error) {
-      logger.error('LightAuth authorization failed.', error);
-      bot.end();
+      if (error instanceof Error && error.message.toLowerCase().includes('lightauth')) {
+        logger.error('LightAuth authorization failed.', error);
+      }
+
+      await this.disconnectBot(bot, logger);
       throw error;
     }
-
-    if (!hasSpawned) {
-      await this.waitForSpawn(bot, configuration);
-    }
-
-    await this.sendGreeting(bot, logger);
-    void this.moveToRallyPoint(bot, configuration, logger).catch((error) => {
-      logger.error('Failed to reach the rally point after spawn.', error);
-    });
   }
 
   private waitForLogin(bot: BotWithClient, configuration: BotConfiguration): Promise<void> {
@@ -260,14 +263,21 @@ export class MineflayerBotClient implements BotClient {
     });
   }
 
-  private isConnectionThrottled(error: unknown): boolean {
+  private isRetryableConnectionError(error: unknown): boolean {
     if (!(error instanceof Error)) {
       return false;
     }
 
     const message = error.message.toLowerCase();
 
-    return message.includes('connection throttled') || message.includes('please wait before reconnecting');
+    return (
+      message.includes('connection throttled') ||
+      message.includes('please wait before reconnecting') ||
+      message.includes('timed out') ||
+      message.includes('econnreset') ||
+      message.includes('socketclosed') ||
+      message.includes('keepaliveerror')
+    );
   }
 
   private formatDisconnectReason(bot: BotWithClient): string {
@@ -482,5 +492,33 @@ export class MineflayerBotClient implements BotClient {
     }
 
     return String(error);
+  }
+
+  private async disconnectBot(bot: BotWithClient, logger: Logger): Promise<void> {
+    if (bot._client.ended || bot._client.socket.destroyed) {
+      return;
+    }
+
+    logger.info('Disconnecting bot after failed startup attempt.');
+
+    await new Promise<void>((resolve) => {
+      const timeoutId = setTimeout(() => {
+        cleanup();
+        resolve();
+      }, 2000);
+
+      const cleanup = () => {
+        clearTimeout(timeoutId);
+        bot.off('end', handleEnd);
+      };
+
+      const handleEnd = () => {
+        cleanup();
+        resolve();
+      };
+
+      bot.once('end', handleEnd);
+      bot.end();
+    });
   }
 }
