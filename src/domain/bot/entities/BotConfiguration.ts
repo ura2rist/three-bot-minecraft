@@ -3,12 +3,19 @@ import { BotRole, SUPPORTED_BOT_ROLES } from './BotRole';
 
 export type BotAuth = 'offline' | 'microsoft';
 
+export interface BotRallyPoint {
+  x: number;
+  y: number;
+  z: number;
+}
+
 export interface BotConfigurationProps {
   role: BotRole;
   host: string;
   port: number;
   username: string;
   password?: string;
+  rallyPoint?: BotRallyPoint;
   version?: string;
   auth: BotAuth;
 }
@@ -19,6 +26,7 @@ export class BotConfiguration {
   public readonly port: number;
   public readonly username: string;
   public readonly password?: string;
+  public readonly rallyPoint?: BotRallyPoint;
   public readonly version?: string;
   public readonly auth: BotAuth;
 
@@ -27,6 +35,7 @@ export class BotConfiguration {
     const host = props.host.trim();
     const username = props.username.trim();
     const password = props.password?.trim();
+    const rallyPoint = this.validateRallyPoint(role, props.rallyPoint);
     const version = props.version?.trim();
 
     if (!SUPPORTED_BOT_ROLES.includes(role)) {
@@ -54,7 +63,28 @@ export class BotConfiguration {
     this.port = props.port;
     this.username = username;
     this.password = password;
+    this.rallyPoint = rallyPoint;
     this.version = version || undefined;
     this.auth = props.auth;
+  }
+
+  private validateRallyPoint(role: BotRole, rallyPoint?: BotRallyPoint): BotRallyPoint | undefined {
+    if (rallyPoint === undefined) {
+      return undefined;
+    }
+
+    if (
+      !Number.isFinite(rallyPoint.x) ||
+      !Number.isFinite(rallyPoint.y) ||
+      !Number.isFinite(rallyPoint.z)
+    ) {
+      throw new DomainError(`Bot "${role}": rallyPoint must contain finite x, y and z coordinates.`);
+    }
+
+    return {
+      x: rallyPoint.x,
+      y: rallyPoint.y,
+      z: rallyPoint.z,
+    };
   }
 }

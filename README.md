@@ -57,7 +57,7 @@ npm run start
 Разделение конфигов такое:
 
 - `.env` хранит общие технические параметры для всех ботов: `host`, `port`, `version`, `auth`.
-- `bots.config.json` хранит только данные конкретных ботов: `role`, `username`, `password`.
+- `bots.config.json` хранит только данные конкретных ботов: `role`, `username`, `password`, `rallyPoint`.
 - Допустимые роли строго ограничены: `farm`, `trading`, `mine`.
 - Каждая роль может быть указана только один раз.
 - Пароль обязателен, потому что используется для регистрации и логина через LightAuth.
@@ -85,21 +85,38 @@ BOT_CONNECT_MAX_RETRIES=2
     {
       "role": "mine",
       "username": "MinerOne",
-      "password": "change_me"
+      "password": "change_me",
+      "rallyPoint": {
+        "x": 213,
+        "y": 64,
+        "z": -77
+      }
     },
     {
       "role": "farm",
       "username": "FarmerOne",
-      "password": "change_me"
+      "password": "change_me",
+      "rallyPoint": {
+        "x": 220,
+        "y": 64,
+        "z": -82
+      }
     },
     {
       "role": "trading",
       "username": "TraderOne",
-      "password": "change_me"
+      "password": "change_me",
+      "rallyPoint": {
+        "x": 205,
+        "y": 64,
+        "z": -70
+      }
     }
   ]
 }
 ```
+
+`rallyPoint` опционален. Если он не указан у конкретного бота, после спавна бот не будет автоматически идти в точку.
 
 ## Конфиги ролей
 

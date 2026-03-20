@@ -11,6 +11,10 @@ type BotWithClient = mineflayer.Bot & {
 };
 
 export class MineflayerBotClient implements BotClient {
+  private readonly rallyHorizontalTolerance = 1.5;
+  private readonly rallyVerticalTolerance = 1.5;
+  private readonly rallyTimeoutMs = this.parseInteger(process.env.BOT_RALLY_TIMEOUT_MS, 120000);
+  private readonly movementControlTickMs = 100;
   private readonly loginTimeoutMs = this.parseInteger(process.env.BOT_LOGIN_TIMEOUT_MS, 20000);
   private readonly spawnTimeoutMs = this.parseInteger(process.env.BOT_SPAWN_TIMEOUT_MS, 20000);
   private readonly retryDelayMs = this.parseInteger(process.env.BOT_CONNECT_RETRY_DELAY_MS, 7000);
@@ -53,9 +57,7 @@ export class MineflayerBotClient implements BotClient {
       username: configuration.username,
       version: configuration.version,
       auth: configuration.auth,
-      plugins: {
-        physics: false,
-      },
+      physicsEnabled: false,
     }) as BotWithClient;
     const authenticator = new LightAuthBotAuthenticator(logger);
     let hasSpawned = false;
@@ -133,6 +135,9 @@ export class MineflayerBotClient implements BotClient {
     }
 
     await this.sendGreeting(bot, logger);
+    void this.moveToRallyPoint(bot, configuration, logger).catch((error) => {
+      logger.error('Failed to reach the rally point after spawn.', error);
+    });
   }
 
   private waitForLogin(bot: BotWithClient, configuration: BotConfiguration): Promise<void> {
@@ -237,6 +242,81 @@ export class MineflayerBotClient implements BotClient {
     logger.info('Retried chat message "hi" after movement.');
   }
 
+  private async moveToRallyPoint(
+    bot: BotWithClient,
+    configuration: BotConfiguration,
+    logger: Logger,
+  ): Promise<void> {
+    if (!bot.entity) {
+      logger.warn('Skipping rally movement because the bot entity is not available.');
+      return;
+    }
+
+    if (!configuration.rallyPoint) {
+      logger.info('No rally point configured. Bot will stay at the spawn area.');
+      return;
+    }
+
+    logger.info(
+      `Heading to rally point ${configuration.rallyPoint.x} ${configuration.rallyPoint.y} ${configuration.rallyPoint.z}.`,
+    );
+
+    bot.physicsEnabled = true;
+    let lastYaw: number | null = null;
+    let stalledTicks = 0;
+    const deadline = Date.now() + this.rallyTimeoutMs;
+
+    try {
+      while (Date.now() < deadline) {
+        if (bot._client.state !== 'play' || !bot.entity) {
+          throw new Error(`Bot is no longer connected. Current state: ${String(bot._client.state)}.`);
+        }
+
+        const currentPosition = bot.entity.position;
+        const deltaX = configuration.rallyPoint.x - currentPosition.x;
+        const deltaY = configuration.rallyPoint.y - currentPosition.y;
+        const deltaZ = configuration.rallyPoint.z - currentPosition.z;
+        const horizontalDistance = Math.hypot(deltaX, deltaZ);
+
+        if (
+          horizontalDistance <= this.rallyHorizontalTolerance &&
+          Math.abs(deltaY) <= this.rallyVerticalTolerance
+        ) {
+          logger.info(
+            `Reached rally point at ${currentPosition.x.toFixed(2)} ${currentPosition.y.toFixed(2)} ${currentPosition.z.toFixed(2)}.`,
+          );
+          return;
+        }
+
+        const desiredYaw = Math.atan2(-deltaX, -deltaZ);
+
+        if (
+          lastYaw === null ||
+          Math.abs(this.normalizeAngle(desiredYaw - lastYaw)) > 0.18
+        ) {
+          await bot.look(desiredYaw, 0, true);
+          lastYaw = desiredYaw;
+        }
+
+        const horizontalSpeed = Math.hypot(bot.entity.velocity.x, bot.entity.velocity.z);
+        stalledTicks = horizontalSpeed < 0.02 ? stalledTicks + 1 : 0;
+
+        bot.setControlState('forward', true);
+        bot.setControlState('sprint', horizontalDistance > 6);
+        bot.setControlState('jump', deltaY > 0.6 || stalledTicks >= 5);
+
+        await this.delay(this.movementControlTickMs);
+      }
+
+      throw new Error(
+        `Timed out after ${this.rallyTimeoutMs}ms before reaching ${configuration.rallyPoint.x} ${configuration.rallyPoint.y} ${configuration.rallyPoint.z}.`,
+      );
+    } finally {
+      bot.clearControlStates();
+      bot.physicsEnabled = false;
+    }
+  }
+
   private waitForChatBlockMessage(bot: BotWithClient, timeoutMs: number): Promise<boolean> {
     const patterns = [
       'нужно немного пройтись',
@@ -298,6 +378,20 @@ export class MineflayerBotClient implements BotClient {
         hasHorizontalCollision: undefined,
       },
     });
+  }
+
+  private normalizeAngle(angle: number): number {
+    let normalized = angle;
+
+    while (normalized <= -Math.PI) {
+      normalized += Math.PI * 2;
+    }
+
+    while (normalized > Math.PI) {
+      normalized -= Math.PI * 2;
+    }
+
+    return normalized;
   }
 
   private parseInteger(value: string | undefined, fallback: number): number {

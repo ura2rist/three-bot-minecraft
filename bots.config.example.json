@@ -3,17 +3,32 @@
     {
       "role": "mine",
       "username": "Gimli",
-      "password": "change_me"
+      "password": "change_me",
+      "rallyPoint": {
+        "x": 213,
+        "y": 64,
+        "z": -77
+      }
     },
     {
       "role": "farm",
       "username": "Gamgee",
-      "password": "change_me"
+      "password": "change_me",
+      "rallyPoint": {
+        "x": 220,
+        "y": 64,
+        "z": -82
+      }
     },
     {
       "role": "trading",
       "username": "Lawrence",
-      "password": "change_me"
+      "password": "change_me",
+      "rallyPoint": {
+        "x": 205,
+        "y": 64,
+        "z": -70
+      }
     }
   ]
 }

@@ -2,7 +2,7 @@ import { existsSync, readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import dotenv from 'dotenv';
 import { BotFleetConfigurationProvider } from '../../application/bot/ports/BotFleetConfigurationProvider';
-import { BotAuth, BotConfiguration } from '../../domain/bot/entities/BotConfiguration';
+import { BotAuth, BotConfiguration, BotRallyPoint } from '../../domain/bot/entities/BotConfiguration';
 import { BotFleetConfiguration } from '../../domain/bot/entities/BotFleetConfiguration';
 import { BotRole, SUPPORTED_BOT_ROLES } from '../../domain/bot/entities/BotRole';
 import { DomainError } from '../../domain/shared/errors/DomainError';
@@ -13,6 +13,7 @@ interface RawBotConfiguration {
   role?: unknown;
   username?: unknown;
   password?: unknown;
+  rallyPoint?: unknown;
 }
 
 interface RawFleetConfiguration {
@@ -87,8 +88,46 @@ export class FileBotFleetConfigurationProvider implements BotFleetConfigurationP
       port: sharedConfig.port,
       username: String(candidate.username ?? ''),
       password: candidate.password === undefined ? undefined : String(candidate.password),
+      rallyPoint: this.mapRallyPoint(candidate.rallyPoint, roleValue as BotRole, index),
       version: sharedConfig.version,
       auth: sharedConfig.auth,
     });
+  }
+
+  private mapRallyPoint(rawRallyPoint: unknown, role: BotRole, index: number): BotRallyPoint | undefined {
+    if (rawRallyPoint === undefined) {
+      return undefined;
+    }
+
+    if (typeof rawRallyPoint !== 'object' || rawRallyPoint === null) {
+      throw new DomainError(`Bot config at index ${index} (${role}): rallyPoint must be an object.`);
+    }
+
+    const candidate = rawRallyPoint as {
+      x?: unknown;
+      y?: unknown;
+      z?: unknown;
+    };
+
+    return {
+      x: this.parseCoordinate(candidate.x, role, index, 'x'),
+      y: this.parseCoordinate(candidate.y, role, index, 'y'),
+      z: this.parseCoordinate(candidate.z, role, index, 'z'),
+    };
+  }
+
+  private parseCoordinate(
+    rawCoordinate: unknown,
+    role: BotRole,
+    index: number,
+    axis: 'x' | 'y' | 'z',
+  ): number {
+    if (typeof rawCoordinate !== 'number' || !Number.isFinite(rawCoordinate)) {
+      throw new DomainError(
+        `Bot config at index ${index} (${role}): rallyPoint.${axis} must be a finite number.`,
+      );
+    }
+
+    return rawCoordinate;
   }
 }
