@@ -44,6 +44,10 @@ type BotWithClient = mineflayer.Bot & {
 
 export class MineflayerBotClient implements BotClient {
   private readonly rallyGoalRange = 1;
+  private readonly rallyMinDistanceToMove = this.parseInteger(
+    process.env.BOT_RALLY_MOVE_DISTANCE_THRESHOLD,
+    50,
+  );
   private readonly rallyTimeoutMs = this.parseInteger(process.env.BOT_RALLY_TIMEOUT_MS, 120000);
   private readonly rallyRetryDelayMs = this.parseInteger(process.env.BOT_RALLY_RETRY_DELAY_MS, 3000);
   private readonly rallySingleAttemptTimeoutMs = this.parseInteger(
@@ -159,6 +163,10 @@ export class MineflayerBotClient implements BotClient {
       }
 
       if (rallyNavigationPromise) {
+        return;
+      }
+
+      if (!this.shouldMoveToRallyPoint(bot, configuration, logger)) {
         return;
       }
 
@@ -569,6 +577,27 @@ export class MineflayerBotClient implements BotClient {
     return Math.sqrt(dx * dx + dy * dy + dz * dz);
   }
 
+  private shouldMoveToRallyPoint(
+    bot: BotWithClient,
+    configuration: BotConfiguration,
+    logger: Logger,
+  ): boolean {
+    if (!configuration.rallyPoint) {
+      return false;
+    }
+
+    const distanceToGoal = this.calculateDistanceToGoal(bot, configuration);
+
+    if (distanceToGoal > this.rallyMinDistanceToMove) {
+      return true;
+    }
+
+    logger.info(
+      `Bot is already within ${this.rallyMinDistanceToMove} blocks of the rally point (${distanceToGoal.toFixed(2)}). Skipping movement.`,
+    );
+    return false;
+  }
+
   private waitForChatBlockMessage(bot: BotWithClient, timeoutMs: number): Promise<boolean> {
     const patterns = [
       'РЅСѓР¶РЅРѕ РЅРµРјРЅРѕРіРѕ РїСЂРѕР№С‚РёСЃСЊ',
@@ -634,12 +663,12 @@ export class MineflayerBotClient implements BotClient {
 
   private createRallyMovements(bot: BotWithClient): PathfinderMovements {
     const movements = new Movements(bot);
-    movements.canDig = false;
+    movements.canDig = true;
     movements.allow1by1towers = false;
-    movements.allowParkour = false;
+    movements.allowParkour = true;
     movements.allowSprinting = true;
-    movements.canOpenDoors = false;
-    movements.maxDropDown = 3;
+    movements.canOpenDoors = true;
+    movements.maxDropDown = 8;
     return movements;
   }
 

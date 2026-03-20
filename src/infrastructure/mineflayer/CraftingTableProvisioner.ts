@@ -296,12 +296,12 @@ export class CraftingTableProvisioner {
 
   private createMovements(bot: BotWithPathfinder): PathfinderMovements {
     const movements = new Movements(bot);
-    movements.canDig = false;
+    movements.canDig = true;
     movements.allow1by1towers = false;
-    movements.allowParkour = false;
+    movements.allowParkour = true;
     movements.allowSprinting = true;
-    movements.canOpenDoors = false;
-    movements.maxDropDown = 3;
+    movements.canOpenDoors = true;
+    movements.maxDropDown = 8;
     return movements;
   }
 
