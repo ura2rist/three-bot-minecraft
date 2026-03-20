@@ -95,9 +95,11 @@ export class MineflayerBotClient implements BotClient {
     const authenticator = new LightAuthBotAuthenticator(logger);
     let hasSpawned = false;
     let isAuthenticated = false;
+    let spawnCount = 0;
     let configurationSettingsSent = false;
     let configurationFallbackTriggered = false;
     let rallyNavigationPromise: Promise<void> | null = null;
+    let rallyNavigationAttempt = 0;
 
     const sendConfigurationSettings = () => {
       if (configurationSettingsSent || bot._client.state !== 'configuration') {
@@ -108,17 +110,45 @@ export class MineflayerBotClient implements BotClient {
       configurationSettingsSent = true;
       logger.info('Client settings packet sent during configuration phase.');
     };
-    const startRallyNavigation = () => {
-      if (!configuration.rallyPoint || rallyNavigationPromise) {
+    const stopRallyNavigation = (reason: string) => {
+      if (!configuration.rallyPoint) {
         return;
       }
 
+      rallyNavigationAttempt += 1;
+      rallyNavigationPromise = null;
+      bot.pathfinder.stop();
+      logger.info(`Stopped rally navigation: ${reason}.`);
+    };
+    const startRallyNavigation = (force = false) => {
+      if (!configuration.rallyPoint) {
+        return;
+      }
+
+      if (force && rallyNavigationPromise) {
+        stopRallyNavigation('restarting route after respawn');
+      }
+
+      if (rallyNavigationPromise) {
+        return;
+      }
+
+      const attempt = rallyNavigationAttempt + 1;
+      rallyNavigationAttempt = attempt;
+
       rallyNavigationPromise = this.moveToRallyPoint(bot, configuration, logger)
         .catch((error) => {
+          if (attempt !== rallyNavigationAttempt) {
+            logger.info('Ignored an outdated rally navigation result.');
+            return;
+          }
+
           logger.error('Failed to reach the rally point after spawn.', error);
         })
         .finally(() => {
-          rallyNavigationPromise = null;
+          if (attempt === rallyNavigationAttempt) {
+            rallyNavigationPromise = null;
+          }
         });
     };
 
@@ -135,12 +165,18 @@ export class MineflayerBotClient implements BotClient {
     });
 
     bot.on('spawn', () => {
+      spawnCount += 1;
       hasSpawned = true;
-      logger.info('Bot spawned in the world.');
+      logger.info(spawnCount === 1 ? 'Bot spawned in the world.' : 'Bot respawned in the world.');
 
       if (isAuthenticated) {
-        startRallyNavigation();
+        startRallyNavigation(true);
       }
+    });
+
+    bot.on('death', () => {
+      logger.warn('Bot died. Rally navigation will restart after respawn.');
+      stopRallyNavigation('bot died');
     });
 
     bot.on('chat', (username, message) => {
