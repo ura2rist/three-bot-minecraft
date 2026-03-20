@@ -26,20 +26,37 @@ export class MineflayerCraftingTablePlacementPort implements CraftingTablePlacem
       throw new Error('Crafting table item is missing after crafting.');
     }
 
-    const placement = this.findPlacementCandidate(configuration);
+    const placements = this.findPlacementCandidates(configuration);
 
-    if (!placement) {
+    if (placements.length === 0) {
       throw new Error('Could not find a valid placement spot for the crafting table near the rally point.');
     }
 
-    await this.gotoPosition(placement.referenceBlock.position, 2);
     await this.bot.equip(craftingTableItem, 'hand');
-    await this.bot.lookAt(placement.placePosition.offset(0.5, 0.5, 0.5), true);
-    await this.bot.placeBlock(placement.referenceBlock, new Vec3(0, 1, 0));
 
-    this.logger.info(
-      `Placed a crafting table at ${placement.placePosition.x} ${placement.placePosition.y} ${placement.placePosition.z}.`,
-    );
+    for (const placement of placements) {
+      try {
+        await this.gotoPosition(placement.referenceBlock.position, 2);
+        await this.bot.lookAt(placement.placePosition.offset(0.5, 0.5, 0.5), true);
+        await this.bot.placeBlock(placement.referenceBlock, new Vec3(0, 1, 0));
+
+        this.logger.info(
+          `Placed a crafting table at ${placement.placePosition.x} ${placement.placePosition.y} ${placement.placePosition.z}.`,
+        );
+        return;
+      } catch (error) {
+        this.logger.warn(
+          `Failed to place a crafting table at ${placement.placePosition.x} ${placement.placePosition.y} ${placement.placePosition.z}: ${this.stringifyError(error)}`,
+        );
+
+        if (await this.hasCraftingTableNearRallyPoint(configuration)) {
+          this.logger.info('Crafting table appeared near the rally point despite a placement timeout.');
+          return;
+        }
+      }
+    }
+
+    throw new Error('Could not place a crafting table in any candidate position near the rally point.');
   }
 
   private findNearbyCraftingTable(configuration: BotConfiguration): Block | null {
@@ -64,14 +81,15 @@ export class MineflayerCraftingTablePlacementPort implements CraftingTablePlacem
     });
   }
 
-  private findPlacementCandidate(
+  private findPlacementCandidates(
     configuration: BotConfiguration,
-  ): { referenceBlock: Block; placePosition: Vec3 } | null {
+  ): Array<{ referenceBlock: Block; placePosition: Vec3 }> {
     if (!configuration.rallyPoint) {
-      return null;
+      return [];
     }
 
     const { x, y, z } = configuration.rallyPoint;
+    const candidates: Array<{ referenceBlock: Block; placePosition: Vec3 }> = [];
 
     for (let distance = 0; distance <= 3; distance += 1) {
       for (let dx = -distance; dx <= distance; dx += 1) {
@@ -90,20 +108,48 @@ export class MineflayerCraftingTablePlacementPort implements CraftingTablePlacem
               continue;
             }
 
+            if (this.isPositionOccupiedByEntity(placePosition)) {
+              continue;
+            }
+
             if (referenceBlock.boundingBox !== 'block') {
               continue;
             }
 
-            return { referenceBlock, placePosition };
+            candidates.push({ referenceBlock, placePosition });
           }
         }
       }
     }
 
-    return null;
+    return candidates;
   }
 
   private findInventoryItem(itemName: string): Item | undefined {
     return this.bot.inventory.items().find((item) => item.name === itemName);
+  }
+
+  private isPositionOccupiedByEntity(placePosition: Vec3): boolean {
+    const occupiesBlock = (position: Vec3): boolean => {
+      return (
+        Math.floor(position.x) === placePosition.x &&
+        Math.floor(position.y) === placePosition.y &&
+        Math.floor(position.z) === placePosition.z
+      );
+    };
+
+    if (occupiesBlock(this.bot.entity.position)) {
+      return true;
+    }
+
+    return Object.values(this.bot.entities).some((entity) => occupiesBlock(entity.position));
+  }
+
+  private stringifyError(error: unknown): string {
+    if (error instanceof Error) {
+      return error.message;
+    }
+
+    return String(error);
   }
 }
