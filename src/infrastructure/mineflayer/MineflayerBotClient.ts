@@ -221,9 +221,9 @@ export class MineflayerBotClient implements BotClient {
       logger.info('Compression packet received.');
     });
 
-    bot._client.on('keep_alive', () => {
-      logger.info(`Keep-alive packet received in state "${String(bot._client.state)}".`);
-    });
+    // bot._client.on('keep_alive', () => {
+    //   logger.info(`Keep-alive packet received in state "${String(bot._client.state)}".`);
+    // });
 
     bot._client.on('registry_data', () => {
       logger.info('Registry data packet received.');
@@ -247,18 +247,18 @@ export class MineflayerBotClient implements BotClient {
 
     const stringEventBot = bot as unknown as StringEventBot;
 
-    stringEventBot.on('goal_reached', () => {
-      logger.info('Pathfinder goal reached.');
-    });
+    // stringEventBot.on('goal_reached', () => {
+    //   logger.info('Pathfinder goal reached.');
+    // });
 
     stringEventBot.on('path_reset', (reason) => {
       logger.warn(`Pathfinder reset the path: ${reason}.`);
     });
 
-    stringEventBot.on('path_update', (...args) => {
-      const [result] = args as [{ status: string; path: unknown[] }];
-      logger.info(`Pathfinder update: ${result.status}, nodes=${result.path.length}.`);
-    });
+    // stringEventBot.on('path_update', (...args) => {
+    //   const [result] = args as [{ status: string; path: unknown[] }];
+    //   logger.info(`Pathfinder update: ${result.status}, nodes=${result.path.length}.`);
+    // });
 
     bot.on('end', (reason) => {
       logger.info(`Bot connection ended: ${reason ?? 'unknown reason'}`);
