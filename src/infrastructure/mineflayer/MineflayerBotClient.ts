@@ -4,17 +4,45 @@ import { BotConfiguration } from '../../domain/bot/entities/BotConfiguration';
 import { Logger } from '../../application/shared/ports/Logger';
 import { LightAuthBotAuthenticator } from './LightAuthBotAuthenticator';
 
+const mineflayerPathfinder = require('../../../.vendor/mineflayer-pathfinder-master');
+const pathfinderPlugin = mineflayerPathfinder.pathfinder as (bot: mineflayer.Bot) => void;
+const Movements = mineflayerPathfinder.Movements as new (bot: mineflayer.Bot) => PathfinderMovements;
+const GoalNear = mineflayerPathfinder.goals.GoalNear as new (
+  x: number,
+  y: number,
+  z: number,
+  range: number,
+) => unknown;
+
+interface PathfinderApi {
+  setMovements(movements: PathfinderMovements): void;
+  goto(goal: unknown): Promise<void>;
+  stop(): void;
+}
+
+interface PathfinderMovements {
+  canDig: boolean;
+  allow1by1towers: boolean;
+  allowParkour: boolean;
+  allowSprinting: boolean;
+  canOpenDoors: boolean;
+  maxDropDown: number;
+}
+
+interface StringEventBot {
+  on(event: string, listener: (...args: unknown[]) => void): void;
+}
+
 type BotWithClient = mineflayer.Bot & {
+  pathfinder: PathfinderApi;
   _client: mineflayer.Bot['_client'] & {
     _lastDisconnectReason?: string;
   };
 };
 
 export class MineflayerBotClient implements BotClient {
-  private readonly rallyHorizontalTolerance = 1.5;
-  private readonly rallyVerticalTolerance = 1.5;
+  private readonly rallyGoalRange = 1;
   private readonly rallyTimeoutMs = this.parseInteger(process.env.BOT_RALLY_TIMEOUT_MS, 120000);
-  private readonly movementControlTickMs = 100;
   private readonly configurationFallbackDelayMs = this.parseInteger(
     process.env.BOT_CONFIGURATION_FALLBACK_DELAY_MS,
     1500,
@@ -61,12 +89,15 @@ export class MineflayerBotClient implements BotClient {
       username: configuration.username,
       version: configuration.version,
       auth: configuration.auth,
-      physicsEnabled: false,
     }) as BotWithClient;
+    bot.loadPlugin(pathfinderPlugin);
+
     const authenticator = new LightAuthBotAuthenticator(logger);
     let hasSpawned = false;
+    let isAuthenticated = false;
     let configurationSettingsSent = false;
     let configurationFallbackTriggered = false;
+    let rallyNavigationPromise: Promise<void> | null = null;
 
     const sendConfigurationSettings = () => {
       if (configurationSettingsSent || bot._client.state !== 'configuration') {
@@ -76,6 +107,19 @@ export class MineflayerBotClient implements BotClient {
       bot.setSettings({});
       configurationSettingsSent = true;
       logger.info('Client settings packet sent during configuration phase.');
+    };
+    const startRallyNavigation = () => {
+      if (!configuration.rallyPoint || rallyNavigationPromise) {
+        return;
+      }
+
+      rallyNavigationPromise = this.moveToRallyPoint(bot, configuration, logger)
+        .catch((error) => {
+          logger.error('Failed to reach the rally point after spawn.', error);
+        })
+        .finally(() => {
+          rallyNavigationPromise = null;
+        });
     };
 
     bot._client.on('connect', () => {
@@ -93,6 +137,10 @@ export class MineflayerBotClient implements BotClient {
     bot.on('spawn', () => {
       hasSpawned = true;
       logger.info('Bot spawned in the world.');
+
+      if (isAuthenticated) {
+        startRallyNavigation();
+      }
     });
 
     bot.on('chat', (username, message) => {
@@ -161,6 +209,21 @@ export class MineflayerBotClient implements BotClient {
       logger.info('Finish configuration packet received.');
     });
 
+    const stringEventBot = bot as unknown as StringEventBot;
+
+    stringEventBot.on('goal_reached', () => {
+      logger.info('Pathfinder goal reached.');
+    });
+
+    stringEventBot.on('path_reset', (reason) => {
+      logger.warn(`Pathfinder reset the path: ${reason}.`);
+    });
+
+    stringEventBot.on('path_update', (...args) => {
+      const [result] = args as [{ status: string; path: unknown[] }];
+      logger.info(`Pathfinder update: ${result.status}, nodes=${result.path.length}.`);
+    });
+
     bot.on('end', (reason) => {
       logger.info(`Bot connection ended: ${reason ?? 'unknown reason'}`);
     });
@@ -177,15 +240,14 @@ export class MineflayerBotClient implements BotClient {
       await this.waitForLogin(bot, configuration);
 
       await authenticator.authenticate(bot, configuration);
+      isAuthenticated = true;
 
       if (!hasSpawned) {
         await this.waitForSpawn(bot, configuration);
       }
 
       if (configuration.rallyPoint) {
-        void this.moveToRallyPoint(bot, configuration, logger).catch((error) => {
-          logger.error('Failed to reach the rally point after spawn.', error);
-        });
+        startRallyNavigation();
         return;
       }
 
@@ -328,75 +390,42 @@ export class MineflayerBotClient implements BotClient {
       `Heading to rally point ${configuration.rallyPoint.x} ${configuration.rallyPoint.y} ${configuration.rallyPoint.z}.`,
     );
 
-    this.primePhysicsMovement(bot, logger);
-    bot.physicsEnabled = true;
-    let lastYaw: number | null = null;
-    let stalledTicks = 0;
-    const deadline = Date.now() + this.rallyTimeoutMs;
+    const movements = this.createRallyMovements(bot);
+    bot.pathfinder.setMovements(movements);
 
     try {
-      while (Date.now() < deadline) {
-        if (bot._client.state !== 'play' || !bot.entity) {
-          throw new Error(`Bot is no longer connected. Current state: ${String(bot._client.state)}.`);
-        }
+      await Promise.race([
+        bot.pathfinder.goto(
+          new GoalNear(
+            configuration.rallyPoint.x,
+            configuration.rallyPoint.y,
+            configuration.rallyPoint.z,
+            this.rallyGoalRange,
+          ),
+        ),
+        this.failAfter(
+          this.rallyTimeoutMs,
+          `Timed out after ${this.rallyTimeoutMs}ms before reaching ${configuration.rallyPoint.x} ${configuration.rallyPoint.y} ${configuration.rallyPoint.z}.`,
+        ),
+      ]);
 
-        const currentPosition = bot.entity.position;
-        const deltaX = configuration.rallyPoint.x - currentPosition.x;
-        const deltaY = configuration.rallyPoint.y - currentPosition.y;
-        const deltaZ = configuration.rallyPoint.z - currentPosition.z;
-        const horizontalDistance = Math.hypot(deltaX, deltaZ);
-
-        if (
-          horizontalDistance <= this.rallyHorizontalTolerance &&
-          Math.abs(deltaY) <= this.rallyVerticalTolerance
-        ) {
-          logger.info(
-            `Reached rally point at ${currentPosition.x.toFixed(2)} ${currentPosition.y.toFixed(2)} ${currentPosition.z.toFixed(2)}.`,
-          );
-          return;
-        }
-
-        const desiredYaw = Math.atan2(-deltaX, -deltaZ);
-
-        if (
-          lastYaw === null ||
-          Math.abs(this.normalizeAngle(desiredYaw - lastYaw)) > 0.18
-        ) {
-          await bot.look(desiredYaw, 0, true);
-          lastYaw = desiredYaw;
-        }
-
-        const horizontalSpeed = Math.hypot(bot.entity.velocity.x, bot.entity.velocity.z);
-        stalledTicks = horizontalSpeed < 0.02 ? stalledTicks + 1 : 0;
-
-        if (stalledTicks > 0 && stalledTicks % 20 === 0) {
-          logger.warn(
-            `Bot is stalled while moving to rally point. Current position: ${currentPosition.x.toFixed(2)} ${currentPosition.y.toFixed(2)} ${currentPosition.z.toFixed(2)}.`,
-          );
-          this.primePhysicsMovement(bot, logger);
-        }
-
-        bot.setControlState('forward', true);
-        bot.setControlState('sprint', horizontalDistance > 6);
-        bot.setControlState('jump', deltaY > 0.6 || stalledTicks >= 5);
-
-        await this.delay(this.movementControlTickMs);
+      if (!bot.entity) {
+        throw new Error('Bot entity is unavailable after pathfinding completed.');
       }
 
-      throw new Error(
-        `Timed out after ${this.rallyTimeoutMs}ms before reaching ${configuration.rallyPoint.x} ${configuration.rallyPoint.y} ${configuration.rallyPoint.z}.`,
+      logger.info(
+        `Reached rally point at ${bot.entity.position.x.toFixed(2)} ${bot.entity.position.y.toFixed(2)} ${bot.entity.position.z.toFixed(2)}.`,
       );
     } finally {
-      bot.clearControlStates();
-      bot.physicsEnabled = false;
+      bot.pathfinder.stop();
     }
   }
 
   private waitForChatBlockMessage(bot: BotWithClient, timeoutMs: number): Promise<boolean> {
     const patterns = [
-      'нужно немного пройтись',
-      'не можете выполнить это действие',
-      'не можете писать в чат',
+      'РЅСѓР¶РЅРѕ РЅРµРјРЅРѕРіРѕ РїСЂРѕР№С‚РёСЃСЊ',
+      'РЅРµ РјРѕР¶РµС‚Рµ РІС‹РїРѕР»РЅРёС‚СЊ СЌС‚Рѕ РґРµР№СЃС‚РІРёРµ',
+      'РЅРµ РјРѕР¶РµС‚Рµ РїРёСЃР°С‚СЊ РІ С‡Р°С‚',
       'muted pre-movement chat',
       'need to walk',
     ];
@@ -455,30 +484,15 @@ export class MineflayerBotClient implements BotClient {
     });
   }
 
-  private primePhysicsMovement(bot: BotWithClient, logger: Logger): void {
-    if (!bot.entity) {
-      return;
-    }
-
-    const flags = {
-      x: false,
-      y: false,
-      z: false,
-      yaw: false,
-      pitch: false,
-    };
-
-    bot._client.emit('position', {
-      x: bot.entity.position.x,
-      y: bot.entity.position.y,
-      z: bot.entity.position.z,
-      yaw: bot.entity.yaw,
-      pitch: bot.entity.pitch,
-      flags,
-      teleportId: 0,
-    });
-
-    logger.info('Primed physics movement from the current bot position.');
+  private createRallyMovements(bot: BotWithClient): PathfinderMovements {
+    const movements = new Movements(bot);
+    movements.canDig = false;
+    movements.allow1by1towers = false;
+    movements.allowParkour = false;
+    movements.allowSprinting = true;
+    movements.canOpenDoors = false;
+    movements.maxDropDown = 3;
+    return movements;
   }
 
   private tryWriteConfigurationPacket(
@@ -496,20 +510,6 @@ export class MineflayerBotClient implements BotClient {
     }
   }
 
-  private normalizeAngle(angle: number): number {
-    let normalized = angle;
-
-    while (normalized <= -Math.PI) {
-      normalized += Math.PI * 2;
-    }
-
-    while (normalized > Math.PI) {
-      normalized -= Math.PI * 2;
-    }
-
-    return normalized;
-  }
-
   private parseInteger(value: string | undefined, fallback: number): number {
     const parsed = Number.parseInt(value ?? '', 10);
 
@@ -522,6 +522,11 @@ export class MineflayerBotClient implements BotClient {
 
   private async delay(ms: number): Promise<void> {
     await new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  private async failAfter(timeoutMs: number, message: string): Promise<never> {
+    await this.delay(timeoutMs);
+    throw new Error(message);
   }
 
   private stringifyError(error: unknown): string {
