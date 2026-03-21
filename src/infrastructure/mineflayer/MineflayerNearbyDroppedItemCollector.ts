@@ -1,9 +1,13 @@
 import { Vec3 } from 'vec3';
+import { Logger } from '../../application/shared/ports/Logger';
 import { BotWithPathfinder } from './MineflayerPortsShared';
+
+const DROPPED_ITEM_ENTITY_NAMES = new Set(['item', 'Item', 'item_stack']);
 
 interface DroppedItemEntity {
   name?: string;
-  objectType?: string;
+  displayName?: string;
+  getDroppedItem?(): unknown | null;
   position: Vec3;
 }
 
@@ -16,6 +20,7 @@ export class MineflayerNearbyDroppedItemCollector {
 
   constructor(
     private readonly bot: BotWithPathfinder,
+    private readonly logger: Logger,
     private readonly gotoPosition: (target: Vec3, range: number) => Promise<void>,
   ) {}
 
@@ -25,7 +30,9 @@ export class MineflayerNearbyDroppedItemCollector {
     }
 
     this.intervalId = setInterval(() => {
-      void this.collectAroundBot().catch(() => undefined);
+      void this.collectAroundBot().catch((error) => {
+        this.logger.error('Failed to collect nearby dropped items.', error);
+      });
     }, this.scanIntervalMs);
   }
 
@@ -97,7 +104,23 @@ export class MineflayerNearbyDroppedItemCollector {
       return false;
     }
 
-    return entity.name === 'item' || entity.objectType === 'Item Stack';
+    if (DROPPED_ITEM_ENTITY_NAMES.has(entity.name ?? '')) {
+      return true;
+    }
+
+    if (entity.displayName === 'Item Stack') {
+      return true;
+    }
+
+    if (typeof entity.getDroppedItem !== 'function') {
+      return false;
+    }
+
+    try {
+      return entity.getDroppedItem() !== null;
+    } catch {
+      return false;
+    }
   }
 
   private isWithinCollectionRange(

@@ -208,6 +208,7 @@ export class MineflayerBotClient implements BotClient {
       const pathfinderBot = this.requirePathfinderBot(bot);
       nearbyDroppedItemCollector = new MineflayerNearbyDroppedItemCollector(
         pathfinderBot,
+        logger.child('pickup'),
         (target, range) => this.gotoPosition(pathfinderBot, target, range),
       );
       return nearbyDroppedItemCollector;
