@@ -7,6 +7,7 @@ import { Logger } from '../../application/shared/ports/Logger';
 import { LightAuthBotAuthenticator } from './LightAuthBotAuthenticator';
 import { MineflayerCraftingTablePlacementPort } from './MineflayerCraftingTablePlacementPort';
 import { MineflayerItemCraftingPort } from './MineflayerItemCraftingPort';
+import { MineflayerNearbyDroppedItemCollector } from './MineflayerNearbyDroppedItemCollector';
 import { MineflayerLogHarvestingPort } from './MineflayerLogHarvestingPort';
 import type { BotWithPathfinder, PathfinderApi, PathfinderMovements } from './MineflayerPortsShared';
 
@@ -153,6 +154,7 @@ export class MineflayerBotClient implements BotClient {
     bot.loadPlugin(pathfinderPlugin);
 
     const authenticator = new LightAuthBotAuthenticator(logger);
+    let nearbyDroppedItemCollector: MineflayerNearbyDroppedItemCollector | null = null;
     let hasSpawned = false;
     let isAuthenticated = false;
     let startupCompleted = false;
@@ -198,6 +200,18 @@ export class MineflayerBotClient implements BotClient {
       reconnectScheduled = true;
       this.scheduleReconnect(configuration, logger, reason);
     };
+    const getNearbyDroppedItemCollector = () => {
+      if (nearbyDroppedItemCollector) {
+        return nearbyDroppedItemCollector;
+      }
+
+      const pathfinderBot = this.requirePathfinderBot(bot);
+      nearbyDroppedItemCollector = new MineflayerNearbyDroppedItemCollector(
+        pathfinderBot,
+        (target, range) => this.gotoPosition(pathfinderBot, target, range),
+      );
+      return nearbyDroppedItemCollector;
+    };
     const startRallyNavigation = (force = false) => {
       if (!configuration.rallyPoint) {
         return;
@@ -227,8 +241,11 @@ export class MineflayerBotClient implements BotClient {
               this.gotoPosition(pathfinderBot, target, range),
             ),
             new MineflayerItemCraftingPort(pathfinderBot, logger),
-            new MineflayerLogHarvestingPort(pathfinderBot, logger, (target, range) =>
-              this.gotoPosition(pathfinderBot, target, range),
+            new MineflayerLogHarvestingPort(
+              pathfinderBot,
+              logger,
+              (target, range) => this.gotoPosition(pathfinderBot, target, range),
+              getNearbyDroppedItemCollector(),
             ),
             logger,
           );
@@ -272,11 +289,13 @@ export class MineflayerBotClient implements BotClient {
       logger.info(spawnCount === 1 ? 'Bot spawned in the world.' : 'Bot respawned in the world.');
 
       if (isAuthenticated) {
+        getNearbyDroppedItemCollector().start();
         startRallyNavigation(true);
       }
     });
 
     bot.on('death', () => {
+      nearbyDroppedItemCollector?.stop();
       logger.warn('Bot died. Rally navigation will restart after respawn.');
       stopRallyNavigation('bot died');
     });
@@ -367,16 +386,19 @@ export class MineflayerBotClient implements BotClient {
     // });
 
     bot.on('end', (reason) => {
+      nearbyDroppedItemCollector?.stop();
       logger.info(`Bot connection ended: ${reason ?? 'unknown reason'}`);
       scheduleReconnect(`connection ended: ${reason ?? 'unknown reason'}`);
     });
 
     bot.on('kicked', (reason) => {
+      nearbyDroppedItemCollector?.stop();
       logger.error(`Bot was kicked: ${String(reason)}`);
       scheduleReconnect(`bot was kicked: ${this.stringifyError(reason)}`);
     });
 
     bot.on('error', (error) => {
+      nearbyDroppedItemCollector?.stop();
       logger.error('Mineflayer client error.', error);
       scheduleReconnect(`client error: ${error.message}`);
     });
@@ -390,6 +412,8 @@ export class MineflayerBotClient implements BotClient {
       if (!hasSpawned) {
         await this.waitForSpawn(bot, configuration);
       }
+
+      getNearbyDroppedItemCollector().start();
 
       if (configuration.rallyPoint) {
         startupCompleted = true;

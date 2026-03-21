@@ -2,6 +2,7 @@ import { Block } from 'prismarine-block';
 import { Vec3 } from 'vec3';
 import { LogHarvestingPort } from '../../application/bot/ports/LogHarvestingPort';
 import { Logger } from '../../application/shared/ports/Logger';
+import { MineflayerNearbyDroppedItemCollector } from './MineflayerNearbyDroppedItemCollector';
 import { BotWithPathfinder } from './MineflayerPortsShared';
 
 const LOG_TO_PLANK_ITEM = new Map<string, string>([
@@ -22,11 +23,13 @@ export class MineflayerLogHarvestingPort implements LogHarvestingPort {
   private readonly resourceSearchRadius = 64;
   private readonly maxLogCandidates = 128;
   private readonly maxHarvestableLogHeightFromGround = 4;
+  private readonly pickupWaitMs = 3000;
 
   constructor(
     private readonly bot: BotWithPathfinder,
     private readonly logger: Logger,
     private readonly gotoPosition: (target: Vec3, range: number) => Promise<void>,
+    private readonly nearbyDroppedItemCollector: MineflayerNearbyDroppedItemCollector,
   ) {}
 
   async gatherNearestLog(): Promise<void> {
@@ -75,8 +78,10 @@ export class MineflayerLogHarvestingPort implements LogHarvestingPort {
       throw new Error(`Cannot dig log block "${targetLog.name}" at the target position.`);
     }
 
+    const logsBeforeDig = this.countInventoryLogs();
     await this.bot.lookAt(targetLog.position.offset(0.5, 0.5, 0.5), true);
     await this.bot.dig(targetLog, true);
+    await this.collectDroppedLog(targetLog.position, logsBeforeDig);
     this.logger.info(`Gathered log block ${targetLog.name}.`);
   }
 
@@ -124,5 +129,30 @@ export class MineflayerLogHarvestingPort implements LogHarvestingPort {
 
   private canDigFromCurrentPosition(target: Vec3): boolean {
     return this.calculateDistanceSquared(target) <= 16;
+  }
+
+  private async collectDroppedLog(dropPosition: Vec3, logsBeforeDig: number): Promise<void> {
+    if (this.countInventoryLogs() > logsBeforeDig) {
+      return;
+    }
+
+    const deadline = Date.now() + this.pickupWaitMs;
+
+    while (Date.now() < deadline) {
+      await this.nearbyDroppedItemCollector.collectAround(dropPosition, 4, 2);
+
+      if (this.countInventoryLogs() > logsBeforeDig) {
+        return;
+      }
+
+      await this.bot.waitForTicks(5);
+    }
+  }
+
+  private countInventoryLogs(): number {
+    return this.bot.inventory
+      .items()
+      .filter((item) => LOG_TO_PLANK_ITEM.has(item.name))
+      .reduce((total, item) => total + item.count, 0);
   }
 }

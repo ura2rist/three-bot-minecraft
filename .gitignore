@@ -7,3 +7,4 @@ bots.config.json
 .idea/
 *.iml
 logs/
+sync-to-windows.local.bat
