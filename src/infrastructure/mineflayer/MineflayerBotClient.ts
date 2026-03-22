@@ -108,6 +108,12 @@ export class MineflayerBotClient implements BotClient {
         `Crafting table provisioning near ${configuration.rallyPoint.x} ${configuration.rallyPoint.y} ${configuration.rallyPoint.z} is assigned to "${configuration.username}".`,
       );
     }
+
+    const microBaseLeaderUsername = this.microBaseAssignmentPolicy.getLeaderUsername();
+
+    if (microBaseLeaderUsername) {
+      this.logger.info(`Micro-base leadership is assigned to "${microBaseLeaderUsername}".`);
+    }
   }
 
   async connect(configuration: BotConfiguration): Promise<void> {
@@ -273,6 +279,7 @@ export class MineflayerBotClient implements BotClient {
       });
     };
     const runPostRallyScenario = async () => {
+      logger.info('Running the post-rally scenario.');
       const pathfinderBot = this.requirePathfinderBot(bot);
       const logHarvestingPort = new MineflayerLogHarvestingPort(
         pathfinderBot,
@@ -290,7 +297,9 @@ export class MineflayerBotClient implements BotClient {
         logger,
       );
 
+      logger.info('Ensuring that a crafting table is available near the rally point.');
       await ensureCraftingTableService.execute(configuration);
+      logger.info('Crafting table step is complete. Starting the micro-base scenario.');
       startMicroBaseScenario();
     };
     const startRallyNavigation = (force = false) => {
@@ -310,6 +319,7 @@ export class MineflayerBotClient implements BotClient {
       rallyNavigationAttempt = attempt;
 
       const shouldMoveToRallyPoint = this.shouldMoveToRallyPoint(bot, configuration, logger);
+      logger.info(`Starting the post-spawn rally scenario. Movement required: ${shouldMoveToRallyPoint}.`);
 
       rallyNavigationPromise = Promise.resolve()
         .then(async () => {

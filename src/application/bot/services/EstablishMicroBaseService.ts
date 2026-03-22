@@ -23,6 +23,11 @@ export class EstablishMicroBaseService {
       return;
     }
 
+    this.logger.info(
+      `Micro-base leader is "${leaderUsername}". Current bot is "${configuration.username}" with role "${configuration.role}".`,
+    );
+
+    this.logger.info('Ensuring a wooden sword before the micro-base scenario.');
     await this.microBasePort.ensureWoodenSwordNearRallyPoint(configuration.rallyPoint);
 
     if (this.assignmentPolicy.isLeader(configuration)) {
