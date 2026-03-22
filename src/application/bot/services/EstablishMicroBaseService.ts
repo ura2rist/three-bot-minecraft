@@ -34,10 +34,6 @@ export class EstablishMicroBaseService {
       `Micro-base leader is "${leaderUsername}". Current bot is "${configuration.username}" with role "${configuration.role}".`,
     );
 
-    this.logger.info('Ensuring a wooden sword before the micro-base scenario.');
-    await this.microBasePort.ensureWoodenSwordNearRallyPoint(configuration.rallyPoint);
-    this.squadWeaponReadinessTracker.markReady(configuration.username);
-
     const task: BotTaskName = this.assignmentPolicy.isLeader(configuration)
       ? 'resource_gathering'
       : 'escort';
@@ -51,6 +47,10 @@ export class EstablishMicroBaseService {
     });
 
     try {
+      this.logger.info('Ensuring a wooden sword before the micro-base scenario.');
+      await this.microBasePort.ensureWoodenSwordNearRallyPoint(configuration.rallyPoint);
+      this.squadWeaponReadinessTracker.markReady(configuration.username);
+
       if (this.assignmentPolicy.isLeader(configuration)) {
         if (!this.squadWeaponReadinessTracker.areAllReady(this.squadUsernames)) {
           this.logger.info('Waiting for the whole squad to equip wooden swords before starting sheep gathering.');

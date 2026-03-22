@@ -22,12 +22,19 @@ interface RegistryEntry {
   id: number;
 }
 
+interface FoodRegistryEntry {
+  foodPoints: number;
+  effectiveQuality: number;
+}
+
 interface RegistryLookup {
   itemsByName: Record<string, RegistryEntry | undefined>;
   blocksByName: Record<string, RegistryEntry | undefined>;
+  foodsByName: Record<string, FoodRegistryEntry | undefined>;
 }
 
 export type BotWithPathfinder = mineflayer.Bot & {
   pathfinder: PathfinderApi;
+  isAlive: boolean;
   registry: mineflayer.Bot['registry'] & RegistryLookup;
 };

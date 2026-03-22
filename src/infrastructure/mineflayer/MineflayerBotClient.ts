@@ -1,4 +1,6 @@
 import mineflayer from 'mineflayer';
+import { Block } from 'prismarine-block';
+import { Vec3 } from 'vec3';
 import { BotActivityEvent } from '../../application/bot/events/BotActivityEvent';
 import { BotPriorityLifecycleSubscriber } from '../../application/bot/subscribers/BotPriorityLifecycleSubscriber';
 import { BotThreatPrioritySubscriber } from '../../application/bot/subscribers/BotThreatPrioritySubscriber';
@@ -12,6 +14,7 @@ import { RandomCraftingTableAssignmentPolicy } from '../../application/bot/servi
 import { BotConfiguration } from '../../domain/bot/entities/BotConfiguration';
 import { Logger } from '../../application/shared/ports/Logger';
 import { LightAuthBotAuthenticator } from './LightAuthBotAuthenticator';
+import { MineflayerAutoEatController } from './MineflayerAutoEatController';
 import { MineflayerCraftingTablePlacementPort } from './MineflayerCraftingTablePlacementPort';
 import { MineflayerItemCraftingPort } from './MineflayerItemCraftingPort';
 import { MineflayerCombatService } from './MineflayerCombatService';
@@ -48,6 +51,13 @@ type BotWithClient = mineflayer.Bot & {
   };
 };
 
+class RallyNavigationCancelledError extends Error {
+  constructor() {
+    super('Rally navigation was superseded by a newer attempt.');
+    this.name = 'RallyNavigationCancelledError';
+  }
+}
+
 export class MineflayerBotClient implements BotClient {
   private readonly rallyGoalRange = 1;
   private readonly rallyMinDistanceToMove = this.parseInteger(
@@ -73,6 +83,7 @@ export class MineflayerBotClient implements BotClient {
     process.env.BOT_CONFIGURATION_FALLBACK_DELAY_MS,
     1500,
   );
+  private readonly rallyDoorSearchRadius = 6;
   private readonly loginTimeoutMs = this.parseInteger(process.env.BOT_LOGIN_TIMEOUT_MS, 20000);
   private readonly spawnTimeoutMs = this.parseInteger(process.env.BOT_SPAWN_TIMEOUT_MS, 20000);
   private readonly retryDelayMs = this.parseInteger(process.env.BOT_CONNECT_RETRY_DELAY_MS, 7000);
@@ -93,6 +104,7 @@ export class MineflayerBotClient implements BotClient {
   private readonly reconnectTimers = new Map<string, NodeJS.Timeout>();
   private readonly reconnectingBots = new Set<string>();
   private readonly friendlyUsernames = new Set<string>();
+  private readonly connectedPathfinderBots = new Map<string, BotWithClient>();
 
   constructor(private readonly logger: Logger) {}
 
@@ -181,6 +193,7 @@ export class MineflayerBotClient implements BotClient {
     bot.loadPlugin(pathfinderPlugin);
 
     const authenticator = new LightAuthBotAuthenticator(logger);
+    let autoEatController: MineflayerAutoEatController | null = null;
     let nearbyDroppedItemCollector: MineflayerNearbyDroppedItemCollector | null = null;
     let squadDefenseController: MineflayerSquadDefenseController | null = null;
     let combatService: MineflayerCombatService | null = null;
@@ -210,6 +223,7 @@ export class MineflayerBotClient implements BotClient {
     const publishEvent = async (event: BotActivityEvent) => {
       await eventBus.publish(event);
     };
+    const isCurrentRallyNavigationAttempt = (attempt: number) => attempt === rallyNavigationAttempt;
     const configurePathfinder = () => {
       if (!bot.pathfinder) {
         return;
@@ -266,6 +280,17 @@ export class MineflayerBotClient implements BotClient {
       );
       return nearbyDroppedItemCollector;
     };
+    const getAutoEatController = () => {
+      if (autoEatController) {
+        return autoEatController;
+      }
+
+      autoEatController = new MineflayerAutoEatController(
+        this.requirePathfinderBot(bot),
+        logger.child('autoeat'),
+      );
+      return autoEatController;
+    };
     const getSquadDefenseController = () => {
       if (squadDefenseController) {
         return squadDefenseController;
@@ -307,16 +332,28 @@ export class MineflayerBotClient implements BotClient {
         microBaseLogger,
         (target, range) => this.gotoPosition(pathfinderBot, target, range),
         getNearbyDroppedItemCollector(),
+        () => priorityCoordinator.waitUntilTaskMayProceed(
+          () => scenarioGeneration === microBaseScenarioGeneration,
+        ),
+        () => priorityCoordinator.isThreatResponseActive(),
       );
       const microBaseService = new EstablishMicroBaseService(
         this.microBaseAssignmentPolicy,
         new MineflayerMicroBasePort(
           pathfinderBot,
+          configuration.role,
           microBaseLogger,
           (target, range) => this.gotoPosition(pathfinderBot, target, range),
           logHarvestingPort,
           getNearbyDroppedItemCollector(),
           getCombatService(),
+          (position, minimumDistance) =>
+            this.requestFriendlyBotsToClearPosition(
+              configuration.username,
+              position,
+              minimumDistance,
+              microBaseLogger,
+            ),
           () => scenarioGeneration === microBaseScenarioGeneration,
           () => priorityCoordinator.waitUntilTaskMayProceed(
             () => scenarioGeneration === microBaseScenarioGeneration,
@@ -330,9 +367,43 @@ export class MineflayerBotClient implements BotClient {
         () => scenarioGeneration === microBaseScenarioGeneration,
       );
 
-      void microBaseService.execute(configuration).catch((error) => {
+      void microBaseService.execute(configuration).catch(async (error) => {
         if (error instanceof MicroBaseScenarioCancelledError) {
           microBaseLogger.info('Micro-base scenario was cancelled and will restart from the beginning if needed.');
+          return;
+        }
+
+        if (
+          scenarioGeneration === microBaseScenarioGeneration &&
+          this.isRetryableRallyNavigationError(error)
+        ) {
+          microBaseLogger.warn(
+            `Micro-base scenario was interrupted before the current step completed. Restarting from the beginning in ${this.rallyRetryDelayMs}ms: ${this.stringifyError(error)}.`,
+          );
+          microBaseScenarioStarted = false;
+          await priorityCoordinator.waitUntilTaskMayProceed(
+            () => scenarioGeneration === microBaseScenarioGeneration,
+          );
+
+          if (
+            scenarioGeneration !== microBaseScenarioGeneration ||
+            !isAuthenticated ||
+            !bot.entity
+          ) {
+            return;
+          }
+
+          await this.delay(this.rallyRetryDelayMs);
+
+          if (
+            scenarioGeneration !== microBaseScenarioGeneration ||
+            !isAuthenticated ||
+            !bot.entity
+          ) {
+            return;
+          }
+
+          startMicroBaseScenario();
           return;
         }
 
@@ -344,28 +415,59 @@ export class MineflayerBotClient implements BotClient {
         microBaseLogger.error('Failed to establish the micro-base scenario.', error);
       });
     };
-    const runPostRallyScenario = async () => {
+    const runPostRallyScenario = async (isCurrentAttempt: () => boolean) => {
+      this.assertCurrentRallyNavigationAttempt(isCurrentAttempt);
       logger.info('Running the post-rally scenario.');
       const pathfinderBot = this.requirePathfinderBot(bot);
+      const waitUntilTaskMayProceed = async () => {
+        this.assertCurrentRallyNavigationAttempt(isCurrentAttempt);
+        await priorityCoordinator.waitUntilTaskMayProceed(() => isCurrentAttempt());
+        this.assertCurrentRallyNavigationAttempt(isCurrentAttempt);
+      };
       const logHarvestingPort = new MineflayerLogHarvestingPort(
         pathfinderBot,
         logger,
         (target, range) => this.gotoPosition(pathfinderBot, target, range),
         getNearbyDroppedItemCollector(),
+        waitUntilTaskMayProceed,
+        () => priorityCoordinator.isThreatResponseActive(),
       );
       const ensureCraftingTableService = new EnsureCraftingTableNearRallyPointService(
         this.craftingTableAssignmentPolicy,
         new MineflayerCraftingTablePlacementPort(pathfinderBot, logger, (target, range) =>
           this.gotoPosition(pathfinderBot, target, range),
+          waitUntilTaskMayProceed,
+          () => priorityCoordinator.isThreatResponseActive(),
         ),
         new MineflayerItemCraftingPort(pathfinderBot, logger),
         logHarvestingPort,
         logger,
       );
 
-      logger.info('Ensuring that a crafting table is available near the rally point.');
-      await ensureCraftingTableService.execute(configuration);
-      logger.info('Crafting table step is complete. Starting the micro-base scenario.');
+      await publishEvent({
+        type: 'bot.task.started',
+        payload: {
+          username: configuration.username,
+          task: 'microbase_setup',
+        },
+      });
+
+      try {
+        logger.info('Ensuring that a crafting table is available near the rally point.');
+        await ensureCraftingTableService.execute(configuration);
+        this.assertCurrentRallyNavigationAttempt(isCurrentAttempt);
+        logger.info('Crafting table step is complete. Starting the micro-base scenario.');
+      } finally {
+        await publishEvent({
+          type: 'bot.task.completed',
+          payload: {
+            username: configuration.username,
+            task: 'microbase_setup',
+          },
+        });
+      }
+
+      this.assertCurrentRallyNavigationAttempt(isCurrentAttempt);
       startMicroBaseScenario();
     };
     const startRallyNavigation = (force = false) => {
@@ -389,18 +491,31 @@ export class MineflayerBotClient implements BotClient {
 
       rallyNavigationPromise = Promise.resolve()
         .then(async () => {
+          const ensureCurrentAttempt = () => {
+            if (!isCurrentRallyNavigationAttempt(attempt)) {
+              throw new RallyNavigationCancelledError();
+            }
+          };
+
           await publishEvent({
             type: 'bot.rally.started',
             payload: {
               username: configuration.username,
             },
           });
+          ensureCurrentAttempt();
 
           if (shouldMoveToRallyPoint) {
-            await this.moveToRallyPoint(bot, configuration, logger);
+            await this.moveToRallyPoint(
+              bot,
+              configuration,
+              logger,
+              () => isCurrentRallyNavigationAttempt(attempt),
+            );
           } else {
             logger.info('Proceeding with the post-rally scenario without movement.');
           }
+          ensureCurrentAttempt();
 
           await publishEvent({
             type: 'bot.rally.completed',
@@ -408,11 +523,12 @@ export class MineflayerBotClient implements BotClient {
               username: configuration.username,
             },
           });
+          ensureCurrentAttempt();
 
-          await runPostRallyScenario();
+          await runPostRallyScenario(() => isCurrentRallyNavigationAttempt(attempt));
         })
         .catch((error) => {
-          if (attempt !== rallyNavigationAttempt) {
+          if (error instanceof RallyNavigationCancelledError || attempt !== rallyNavigationAttempt) {
             return;
           }
 
@@ -436,6 +552,7 @@ export class MineflayerBotClient implements BotClient {
 
     bot.on('inject_allowed', () => {
       configurePathfinder();
+      this.connectedPathfinderBots.set(configuration.username, bot);
       logger.info('Mineflayer injection allowed.');
     });
 
@@ -460,6 +577,7 @@ export class MineflayerBotClient implements BotClient {
       }
 
       if (isAuthenticated) {
+        getAutoEatController().start();
         getNearbyDroppedItemCollector().start();
         getSquadDefenseController().start();
         startRallyNavigation(true);
@@ -467,6 +585,7 @@ export class MineflayerBotClient implements BotClient {
     });
 
     bot.on('death', () => {
+      autoEatController?.stop();
       nearbyDroppedItemCollector?.stop();
       squadDefenseController?.stop();
       this.squadWeaponReadinessTracker.clearReady(configuration.username);
@@ -569,6 +688,8 @@ export class MineflayerBotClient implements BotClient {
     // });
 
     bot.on('end', (reason) => {
+      autoEatController?.stop();
+      this.connectedPathfinderBots.delete(configuration.username);
       nearbyDroppedItemCollector?.stop();
       squadDefenseController?.stop();
       this.squadWeaponReadinessTracker.clearReady(configuration.username);
@@ -585,6 +706,8 @@ export class MineflayerBotClient implements BotClient {
     });
 
     bot.on('kicked', (reason) => {
+      autoEatController?.stop();
+      this.connectedPathfinderBots.delete(configuration.username);
       nearbyDroppedItemCollector?.stop();
       squadDefenseController?.stop();
       this.squadWeaponReadinessTracker.clearReady(configuration.username);
@@ -601,6 +724,8 @@ export class MineflayerBotClient implements BotClient {
     });
 
     bot.on('error', (error) => {
+      autoEatController?.stop();
+      this.connectedPathfinderBots.delete(configuration.username);
       nearbyDroppedItemCollector?.stop();
       squadDefenseController?.stop();
       this.squadWeaponReadinessTracker.clearReady(configuration.username);
@@ -626,6 +751,7 @@ export class MineflayerBotClient implements BotClient {
         await this.waitForSpawn(bot, configuration);
       }
 
+      getAutoEatController().start();
       getNearbyDroppedItemCollector().start();
       getSquadDefenseController().start();
 
@@ -730,23 +856,23 @@ export class MineflayerBotClient implements BotClient {
       message.includes('keepaliveerror') ||
       message.includes('client timed out') ||
       message.includes('write econnreset') ||
-      message.includes('socket closed')
+      message.includes('socket closed') ||
+      message.includes('enotfound') ||
+      message.includes('eai_again')
     );
   }
 
   private isRetryableRallyNavigationError(error: unknown): boolean {
-    if (!(error instanceof Error)) {
-      return false;
-    }
-
-    const message = error.message.toLowerCase();
+    const message = this.stringifyError(error).toLowerCase();
 
     return (
       message.includes('no path to the goal') ||
       message.includes('timed out') ||
       message.includes('timeout waiting for') ||
+      message.includes('took to long to decide path to goal') ||
       message.includes('stuck') ||
       message.includes('goal changed') ||
+      message.includes('path was stopped') ||
       message.includes('path stopped') ||
       message.includes('goal was not actually reached')
     );
@@ -781,6 +907,7 @@ export class MineflayerBotClient implements BotClient {
     bot: BotWithClient,
     configuration: BotConfiguration,
     logger: Logger,
+    isCurrentAttempt: () => boolean,
   ): Promise<void> {
     if (!bot.pathfinder) {
       throw new Error('Pathfinder plugin is not available on the bot instance.');
@@ -801,22 +928,22 @@ export class MineflayerBotClient implements BotClient {
     );
 
     const movements = this.createRallyMovements(bot);
-    const deadline = Date.now() + this.rallyTimeoutMs;
+    let progressDeadline = Date.now() + this.rallyTimeoutMs;
 
     if (this.rallyStabilizationTicks > 0) {
       await bot.waitForTicks(this.rallyStabilizationTicks);
+      this.assertCurrentRallyNavigationAttempt(isCurrentAttempt);
     }
 
-    while (Date.now() < deadline) {
+    while (true) {
+      this.assertCurrentRallyNavigationAttempt(isCurrentAttempt);
       bot.pathfinder.setMovements(movements);
 
       try {
         await this.waitForChunksForRally(bot, logger);
+        this.assertCurrentRallyNavigationAttempt(isCurrentAttempt);
 
-        const attemptTimeoutMs = Math.min(
-          this.rallySingleAttemptTimeoutMs,
-          Math.max(deadline - Date.now(), 1000),
-        );
+        const attemptTimeoutMs = this.rallySingleAttemptTimeoutMs;
         const goal = this.createNextRallyGoal(bot, configuration);
 
         await Promise.race([
@@ -826,6 +953,7 @@ export class MineflayerBotClient implements BotClient {
             `Timed out after ${attemptTimeoutMs}ms while building or following a route to ${configuration.rallyPoint.x} ${configuration.rallyPoint.y} ${configuration.rallyPoint.z}.`,
           ),
         ]);
+        this.assertCurrentRallyNavigationAttempt(isCurrentAttempt);
 
         if (!bot.entity) {
           throw new Error('Bot entity is unavailable after pathfinding completed.');
@@ -844,22 +972,117 @@ export class MineflayerBotClient implements BotClient {
         );
         return;
       } catch (error) {
-        if (!this.isRetryableRallyNavigationError(error) || Date.now() + this.rallyRetryDelayMs >= deadline) {
+        if (error instanceof RallyNavigationCancelledError) {
           throw error;
         }
 
-        logger.warn(
-          `Could not reach the rally point yet. Retrying in ${this.rallyRetryDelayMs}ms: ${this.stringifyError(error)}.`,
-        );
+        if (!isCurrentAttempt()) {
+          throw new RallyNavigationCancelledError();
+        }
+
+        if (!this.isRetryableRallyNavigationError(error)) {
+          throw error;
+        }
+
+        if (await this.tryEnterRallyPointThroughNearbyDoor(bot, configuration, logger, isCurrentAttempt)) {
+          const distanceToGoal = this.calculateDistanceToGoal(bot, configuration);
+
+          if (distanceToGoal <= this.rallyGoalRange + 1.5) {
+            logger.info(
+              `Reached rally point at ${bot.entity.position.x.toFixed(2)} ${bot.entity.position.y.toFixed(2)} ${bot.entity.position.z.toFixed(2)}.`,
+            );
+            return;
+          }
+        }
+
+        if (Date.now() + this.rallyRetryDelayMs >= progressDeadline) {
+          logger.info(
+            `Я еще иду к точке сбора ${configuration.rallyPoint.x} ${configuration.rallyPoint.y} ${configuration.rallyPoint.z}. Продолжаю искать путь: ${this.stringifyError(error)}.`,
+          );
+          progressDeadline = Date.now() + this.rallyTimeoutMs;
+        } else {
+          logger.warn(
+            `Could not reach the rally point yet. Retrying in ${this.rallyRetryDelayMs}ms: ${this.stringifyError(error)}.`,
+          );
+        }
+
         await this.delay(this.rallyRetryDelayMs);
+        this.assertCurrentRallyNavigationAttempt(isCurrentAttempt);
       } finally {
         bot.pathfinder.stop();
       }
     }
+  }
 
-    throw new Error(
-      `Timed out after ${this.rallyTimeoutMs}ms before reaching ${configuration.rallyPoint.x} ${configuration.rallyPoint.y} ${configuration.rallyPoint.z}.`,
+  private async tryEnterRallyPointThroughNearbyDoor(
+    bot: BotWithClient,
+    configuration: BotConfiguration,
+    logger: Logger,
+    isCurrentAttempt: () => boolean,
+  ): Promise<boolean> {
+    if (!configuration.rallyPoint || !bot.entity || !bot.pathfinder) {
+      return false;
+    }
+
+    const distanceToGoal = this.calculateDistanceToGoal(bot, configuration);
+
+    if (distanceToGoal > this.rallyMinDistanceToMove + 1) {
+      return false;
+    }
+
+    const nearbyDoor = this.findNearestDoorNearRallyPoint(bot, configuration);
+
+    if (!nearbyDoor) {
+      return false;
+    }
+
+    const rallyPoint = configuration.rallyPoint;
+    const xDistanceToRally = rallyPoint.x - nearbyDoor.position.x;
+    const zDistanceToRally = rallyPoint.z - nearbyDoor.position.z;
+    const moveAlongX = Math.abs(xDistanceToRally) >= Math.abs(zDistanceToRally);
+    const step = moveAlongX
+      ? new Vec3(Math.sign(xDistanceToRally) || 1, 0, 0)
+      : new Vec3(0, 0, Math.sign(zDistanceToRally) || 1);
+    const interiorTarget = new Vec3(
+      nearbyDoor.position.x + step.x * 2,
+      configuration.rallyPoint.y,
+      nearbyDoor.position.z + step.z * 2,
     );
+    const distanceBeforeDoorAssist = this.calculateDistanceToGoal(bot, configuration);
+
+    try {
+      this.assertCurrentRallyNavigationAttempt(isCurrentAttempt);
+      await this.gotoPosition(bot as BotWithPathfinder, nearbyDoor.position, 1);
+      this.assertCurrentRallyNavigationAttempt(isCurrentAttempt);
+
+      await this.openDoorIfNeeded(bot, nearbyDoor);
+
+      this.assertCurrentRallyNavigationAttempt(isCurrentAttempt);
+      await this.stepTowardsTarget(bot, interiorTarget, 10);
+      await this.gotoPosition(bot as BotWithPathfinder, interiorTarget, 1).catch(() => undefined);
+      const distanceAfterDoorAssist = this.calculateDistanceToGoal(bot, configuration);
+
+      if (
+        distanceAfterDoorAssist > this.rallyGoalRange + 1.5 &&
+        distanceAfterDoorAssist >= distanceBeforeDoorAssist - 0.5
+      ) {
+        return false;
+      }
+
+      logger.info(
+        `Entered the shelter through a nearby door at ${nearbyDoor.position.x} ${nearbyDoor.position.y} ${nearbyDoor.position.z} while approaching the rally point.`,
+      );
+      return true;
+    } catch (error) {
+      if (error instanceof RallyNavigationCancelledError) {
+        throw error;
+      }
+
+      logger.info(
+        `Could not use a nearby door to enter the rally point shelter yet: ${this.stringifyError(error)}.`,
+      );
+      return false;
+    }
   }
 
   private async waitForChunksForRally(bot: BotWithClient, logger: Logger): Promise<void> {
@@ -893,6 +1116,112 @@ export class MineflayerBotClient implements BotClient {
     const dz = bot.entity.position.z - configuration.rallyPoint.z;
 
     return Math.sqrt(dx * dx + dz * dz);
+  }
+
+  private findNearestDoorNearRallyPoint(bot: BotWithClient, configuration: BotConfiguration): Block | null {
+    if (!configuration.rallyPoint || !bot.entity) {
+      return null;
+    }
+
+    const rallyCenter = new Vec3(configuration.rallyPoint.x, configuration.rallyPoint.y, configuration.rallyPoint.z);
+    let nearestDoor: Block | null = null;
+    let nearestDistance = Number.POSITIVE_INFINITY;
+
+    for (let dx = -this.rallyDoorSearchRadius; dx <= this.rallyDoorSearchRadius; dx += 1) {
+      for (let dy = -1; dy <= 2; dy += 1) {
+        for (let dz = -this.rallyDoorSearchRadius; dz <= this.rallyDoorSearchRadius; dz += 1) {
+          const candidate = bot.blockAt(rallyCenter.offset(dx, dy, dz));
+
+          if (!candidate || !this.isDoorBlock(candidate.name)) {
+            continue;
+          }
+
+          const normalizedDoor = this.normalizeDoorBlock(bot, candidate);
+
+          if (!normalizedDoor) {
+            continue;
+          }
+
+          const distanceToBot = bot.entity.position.distanceTo(normalizedDoor.position);
+
+          if (distanceToBot >= nearestDistance) {
+            continue;
+          }
+
+          nearestDistance = distanceToBot;
+          nearestDoor = normalizedDoor;
+        }
+      }
+    }
+
+    return nearestDoor;
+  }
+
+  private normalizeDoorBlock(bot: BotWithClient, block: Block): Block | null {
+    if (!this.isDoorBlock(block.name)) {
+      return null;
+    }
+
+    const doorProperties = block.getProperties();
+
+    if (doorProperties.half === 'upper') {
+      const lowerDoorBlock = bot.blockAt(block.position.offset(0, -1, 0));
+
+      if (lowerDoorBlock && this.isDoorBlock(lowerDoorBlock.name)) {
+        return lowerDoorBlock;
+      }
+    }
+
+    return block;
+  }
+
+  private isDoorBlock(blockName: string): boolean {
+    return blockName.endsWith('_door');
+  }
+
+  private isDoorOpen(block: Block): boolean {
+    return block.getProperties().open === true;
+  }
+
+  private async openDoorIfNeeded(bot: BotWithClient, doorBlock: Block): Promise<void> {
+    const normalizedDoor = this.normalizeDoorBlock(bot, doorBlock) ?? doorBlock;
+
+    if (!this.isDoorOpen(normalizedDoor)) {
+      await bot.lookAt(normalizedDoor.position.offset(0.5, 0.5, 0.5), true).catch(() => undefined);
+      await bot.activateBlock(normalizedDoor).catch(() => undefined);
+      await bot.waitForTicks(10);
+    }
+
+    const refreshedDoor = this.normalizeDoorBlock(bot, bot.blockAt(normalizedDoor.position) ?? normalizedDoor);
+
+    if (refreshedDoor && this.isDoorOpen(refreshedDoor)) {
+      return;
+    }
+
+    const upperDoorBlock = bot.blockAt(normalizedDoor.position.offset(0, 1, 0));
+
+    if (upperDoorBlock && this.isDoorBlock(upperDoorBlock.name)) {
+      await bot.lookAt(upperDoorBlock.position.offset(0.5, 0.5, 0.5), true).catch(() => undefined);
+      await bot.activateBlock(upperDoorBlock).catch(() => undefined);
+      await bot.waitForTicks(10);
+    }
+  }
+
+  private async stepTowardsTarget(bot: BotWithClient, target: Vec3, ticks: number): Promise<void> {
+    await bot.lookAt(target.offset(0.5, 0, 0.5), true).catch(() => undefined);
+    bot.setControlState('forward', true);
+
+    try {
+      await bot.waitForTicks(ticks);
+    } finally {
+      bot.setControlState('forward', false);
+    }
+  }
+
+  private assertCurrentRallyNavigationAttempt(isCurrentAttempt: () => boolean): void {
+    if (!isCurrentAttempt()) {
+      throw new RallyNavigationCancelledError();
+    }
   }
 
   private createNextRallyGoal(bot: BotWithClient, configuration: BotConfiguration): unknown {
@@ -1016,6 +1345,107 @@ export class MineflayerBotClient implements BotClient {
     movements.canOpenDoors = true;
     movements.maxDropDown = 4;
     return movements;
+  }
+
+  private async requestFriendlyBotsToClearPosition(
+    requestingUsername: string,
+    position: Vec3,
+    minimumDistance: number,
+    logger: Logger,
+  ): Promise<void> {
+    for (const [username, bot] of this.connectedPathfinderBots.entries()) {
+      if (username === requestingUsername || !this.isFriendlyBotBlockingPosition(bot, position)) {
+        continue;
+      }
+
+      const clearanceTarget = this.findFriendlyClearanceTarget(bot, position, minimumDistance);
+
+      if (!clearanceTarget) {
+        logger.warn(
+          `Could not find a safe nearby point to clear "${username}" away from ${position.x} ${position.y} ${position.z}.`,
+        );
+        continue;
+      }
+
+      logger.info(
+        `Asking "${username}" to clear the build position at ${position.x} ${position.y} ${position.z}.`,
+      );
+
+      try {
+        await this.gotoPosition(this.requirePathfinderBot(bot), clearanceTarget, 1);
+      } catch (error) {
+        logger.warn(
+          `Could not move "${username}" away from the build position: ${this.stringifyError(error)}.`,
+        );
+      }
+    }
+  }
+
+  private isFriendlyBotBlockingPosition(bot: BotWithClient, position: Vec3): boolean {
+    if (!bot.entity) {
+      return false;
+    }
+
+    const entityPosition = bot.entity.position;
+    const targetCenter = position.offset(0.5, 0.5, 0.5);
+
+    return (
+      Math.abs(entityPosition.y - position.y) < 2 &&
+      entityPosition.distanceTo(targetCenter) < 0.95
+    );
+  }
+
+  private findFriendlyClearanceTarget(
+    bot: BotWithClient,
+    blockedPosition: Vec3,
+    minimumDistance: number,
+  ): Vec3 | null {
+    if (!bot.entity) {
+      return null;
+    }
+
+    const candidateOffsets = [
+      new Vec3(minimumDistance, 0, 0),
+      new Vec3(-minimumDistance, 0, 0),
+      new Vec3(0, 0, minimumDistance),
+      new Vec3(0, 0, -minimumDistance),
+      new Vec3(minimumDistance + 1, 0, 0),
+      new Vec3(-minimumDistance - 1, 0, 0),
+      new Vec3(0, 0, minimumDistance + 1),
+      new Vec3(0, 0, -minimumDistance - 1),
+    ];
+    const botY = Math.floor(bot.entity.position.y);
+
+    const candidates = candidateOffsets
+      .map((offset) => new Vec3(blockedPosition.x + offset.x, botY, blockedPosition.z + offset.z))
+      .filter((candidate) => !this.isFriendlyPositionOccupied(candidate, bot.username));
+
+    if (candidates.length === 0) {
+      return null;
+    }
+
+    candidates.sort(
+      (left, right) =>
+        bot.entity!.position.distanceTo(left) - bot.entity!.position.distanceTo(right),
+    );
+
+    return candidates[0] ?? null;
+  }
+
+  private isFriendlyPositionOccupied(position: Vec3, ignoredUsername: string): boolean {
+    for (const [username, bot] of this.connectedPathfinderBots.entries()) {
+      if (username === ignoredUsername || !bot.entity) {
+        continue;
+      }
+
+      const targetCenter = position.offset(0.5, 0.5, 0.5);
+
+      if (Math.abs(bot.entity.position.y - position.y) < 2 && bot.entity.position.distanceTo(targetCenter) < 0.95) {
+        return true;
+      }
+    }
+
+    return false;
   }
 
   private async gotoPosition(bot: BotWithPathfinder, target: { x: number; y: number; z: number }, range: number): Promise<void> {

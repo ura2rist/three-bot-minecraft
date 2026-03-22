@@ -6,6 +6,9 @@ import { ItemCraftingPort } from '../ports/ItemCraftingPort';
 import { LogHarvestingPort } from '../ports/LogHarvestingPort';
 
 export class EnsureCraftingTableNearRallyPointService {
+  private readonly craftingTableWaitTimeoutMs = 180000;
+  private readonly craftingTableWaitPollIntervalMs = 1000;
+
   constructor(
     private readonly assignmentPolicy: CraftingTableAssignmentPolicy,
     private readonly placementPort: CraftingTablePlacementPort,
@@ -27,8 +30,9 @@ export class EnsureCraftingTableNearRallyPointService {
     if (!this.assignmentPolicy.isAssignedCrafter(configuration)) {
       const assignedUsername = this.assignmentPolicy.getAssignedUsername(configuration);
       this.logger.info(
-        `Crafting table provisioning is assigned to "${assignedUsername ?? 'another bot'}". Skipping this bot.`,
+        `Crafting table provisioning is assigned to "${assignedUsername ?? 'another bot'}". Waiting for the crafting table to appear near the rally point.`,
       );
+      await this.waitForCraftingTableNearRallyPoint(configuration);
       return;
     }
 
@@ -41,6 +45,21 @@ export class EnsureCraftingTableNearRallyPointService {
     }
 
     await this.placementPort.placeCraftingTableNearRallyPoint(configuration);
+  }
+
+  private async waitForCraftingTableNearRallyPoint(configuration: BotConfiguration): Promise<void> {
+    const deadline = Date.now() + this.craftingTableWaitTimeoutMs;
+
+    while (Date.now() < deadline) {
+      if (await this.placementPort.hasCraftingTableNearRallyPoint(configuration)) {
+        this.logger.info('Crafting table appeared near the rally point while waiting for the assigned bot.');
+        return;
+      }
+
+      await this.delay(this.craftingTableWaitPollIntervalMs);
+    }
+
+    throw new Error('Ой, не могу найти верстак рядом с точкой сбора.');
   }
 
   private async ensureCraftingTableItem(): Promise<void> {
@@ -73,5 +92,9 @@ export class EnsureCraftingTableNearRallyPointService {
     }
 
     throw new Error('Failed to gather enough resources to craft a crafting table.');
+  }
+
+  private async delay(ms: number): Promise<void> {
+    await new Promise((resolve) => setTimeout(resolve, ms));
   }
 }

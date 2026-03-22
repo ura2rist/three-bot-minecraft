@@ -13,6 +13,8 @@ export class MineflayerCraftingTablePlacementPort implements CraftingTablePlacem
     private readonly bot: BotWithPathfinder,
     private readonly logger: Logger,
     private readonly gotoPosition: (target: Vec3, range: number) => Promise<void>,
+    private readonly waitUntilTaskMayProceed: () => Promise<void> = async () => undefined,
+    private readonly isThreatResponseActive: () => boolean = () => false,
   ) {}
 
   async hasCraftingTableNearRallyPoint(configuration: BotConfiguration): Promise<boolean> {
@@ -20,6 +22,7 @@ export class MineflayerCraftingTablePlacementPort implements CraftingTablePlacem
   }
 
   async placeCraftingTableNearRallyPoint(configuration: BotConfiguration): Promise<void> {
+    await this.waitForTaskPriority();
     const craftingTableItem = this.findInventoryItem('crafting_table');
 
     if (!craftingTableItem) {
@@ -36,7 +39,7 @@ export class MineflayerCraftingTablePlacementPort implements CraftingTablePlacem
 
     for (const placement of placements) {
       try {
-        await this.gotoPosition(placement.referenceBlock.position, 2);
+        await this.navigateTo(placement.referenceBlock.position, 2);
         await this.bot.lookAt(placement.placePosition.offset(0.5, 0.5, 0.5), true);
         await this.bot.placeBlock(placement.referenceBlock, new Vec3(0, 1, 0));
 
@@ -151,5 +154,40 @@ export class MineflayerCraftingTablePlacementPort implements CraftingTablePlacem
     }
 
     return String(error);
+  }
+
+  private async navigateTo(target: Vec3, range: number): Promise<void> {
+    while (true) {
+      await this.waitForTaskPriority();
+
+      try {
+        await this.gotoPosition(target, range);
+        return;
+      } catch (error) {
+        if (this.isThreatResponseActive() && this.isRetryablePriorityInterruption(error)) {
+          this.logger.info(
+            `Pausing crafting-table placement because combat has higher priority: ${this.stringifyError(error)}.`,
+          );
+          await this.waitForTaskPriority();
+          continue;
+        }
+
+        throw error;
+      }
+    }
+  }
+
+  private async waitForTaskPriority(): Promise<void> {
+    await this.waitUntilTaskMayProceed();
+  }
+
+  private isRetryablePriorityInterruption(error: unknown): boolean {
+    const message = this.stringifyError(error).toLowerCase();
+
+    return (
+      message.includes('goal changed') ||
+      message.includes('path was stopped') ||
+      message.includes('path stopped before it could be completed')
+    );
   }
 }
