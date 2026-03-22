@@ -139,14 +139,35 @@ export class MineflayerLogHarvestingPort implements LogHarvestingPort {
     const deadline = Date.now() + this.pickupWaitMs;
 
     while (Date.now() < deadline) {
-      await this.nearbyDroppedItemCollector.collectAround(dropPosition, 4, 2);
+      try {
+        await this.nearbyDroppedItemCollector.collectAround(dropPosition, 4, 2);
+      } catch (error) {
+        if (!this.nearbyDroppedItemCollector.hasDroppedItemNearby(dropPosition, 4, 2)) {
+          this.logger.warn(
+            `Dropped items are no longer visible near ${dropPosition.x} ${dropPosition.y} ${dropPosition.z}. Continuing without an explicit pickup path.`,
+          );
+          return;
+        }
+
+        this.logger.warn(
+          `Could not collect dropped items near ${dropPosition.x} ${dropPosition.y} ${dropPosition.z}: ${this.stringifyError(error)}.`,
+        );
+      }
 
       if (this.countInventoryLogs() > logsBeforeDig) {
         return;
       }
 
+      if (!this.nearbyDroppedItemCollector.hasDroppedItemNearby(dropPosition, 4, 2)) {
+        return;
+      }
+
       await this.bot.waitForTicks(5);
     }
+
+    this.logger.warn(
+      `Timed out while waiting to pick up drops near ${dropPosition.x} ${dropPosition.y} ${dropPosition.z}. Continuing with the next harvesting step.`,
+    );
   }
 
   private countInventoryLogs(): number {
@@ -154,5 +175,13 @@ export class MineflayerLogHarvestingPort implements LogHarvestingPort {
       .items()
       .filter((item) => LOG_TO_PLANK_ITEM.has(item.name))
       .reduce((total, item) => total + item.count, 0);
+  }
+
+  private stringifyError(error: unknown): string {
+    if (error instanceof Error) {
+      return error.message;
+    }
+
+    return String(error);
   }
 }

@@ -68,6 +68,10 @@ export class MineflayerNearbyDroppedItemCollector {
     return collectionPromise;
   }
 
+  hasDroppedItemNearby(center: Vec3, horizontalRange = 4, verticalRange = 2): boolean {
+    return this.findNearestDroppedItem(center, horizontalRange, verticalRange) !== null;
+  }
+
   private async performCollection(
     center: Vec3,
     horizontalRange: number,
@@ -82,7 +86,19 @@ export class MineflayerNearbyDroppedItemCollector {
         return collectedAny;
       }
 
-      await this.gotoPosition(droppedItem.position, 1);
+      try {
+        await this.gotoPosition(droppedItem.position, 1);
+      } catch (error) {
+        if (!this.hasDroppedItemNearby(center, horizontalRange, verticalRange)) {
+          return collectedAny;
+        }
+
+        this.logger.warn(
+          `Skipping dropped-item collection attempt near ${droppedItem.position.x.toFixed(1)} ${droppedItem.position.y.toFixed(1)} ${droppedItem.position.z.toFixed(1)}: ${this.stringifyError(error)}`,
+        );
+        return collectedAny;
+      }
+
       collectedAny = true;
       await this.bot.waitForTicks(5);
     }
@@ -143,5 +159,13 @@ export class MineflayerNearbyDroppedItemCollector {
     const dz = left.z - right.z;
 
     return dx * dx + dy * dy + dz * dz;
+  }
+
+  private stringifyError(error: unknown): string {
+    if (error instanceof Error) {
+      return error.message;
+    }
+
+    return String(error);
   }
 }
