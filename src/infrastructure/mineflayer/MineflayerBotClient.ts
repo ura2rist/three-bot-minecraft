@@ -14,6 +14,7 @@ import { Logger } from '../../application/shared/ports/Logger';
 import { LightAuthBotAuthenticator } from './LightAuthBotAuthenticator';
 import { MineflayerCraftingTablePlacementPort } from './MineflayerCraftingTablePlacementPort';
 import { MineflayerItemCraftingPort } from './MineflayerItemCraftingPort';
+import { MineflayerCombatService } from './MineflayerCombatService';
 import { MicroBaseScenarioCancelledError, MineflayerMicroBasePort } from './MineflayerMicroBasePort';
 import { MineflayerNearbyDroppedItemCollector } from './MineflayerNearbyDroppedItemCollector';
 import { MineflayerLogHarvestingPort } from './MineflayerLogHarvestingPort';
@@ -182,6 +183,7 @@ export class MineflayerBotClient implements BotClient {
     const authenticator = new LightAuthBotAuthenticator(logger);
     let nearbyDroppedItemCollector: MineflayerNearbyDroppedItemCollector | null = null;
     let squadDefenseController: MineflayerSquadDefenseController | null = null;
+    let combatService: MineflayerCombatService | null = null;
     let hasSpawned = false;
     let isAuthenticated = false;
     let startupCompleted = false;
@@ -270,15 +272,25 @@ export class MineflayerBotClient implements BotClient {
       }
 
       const pathfinderBot = this.requirePathfinderBot(bot);
+      const sharedCombatService = getCombatService();
       squadDefenseController = new MineflayerSquadDefenseController(
         pathfinderBot,
         logger.child('defense'),
         this.friendlyUsernames,
         (target, range) => this.gotoPosition(pathfinderBot, target, range),
+        sharedCombatService,
         () => priorityCoordinator.canInterruptWithThreatResponse(),
         publishEvent,
       );
       return squadDefenseController;
+    };
+    const getCombatService = () => {
+      if (combatService) {
+        return combatService;
+      }
+
+      combatService = new MineflayerCombatService(this.requirePathfinderBot(bot));
+      return combatService;
     };
     const startMicroBaseScenario = () => {
       if (!configuration.rallyPoint || microBaseScenarioStarted) {
@@ -304,6 +316,7 @@ export class MineflayerBotClient implements BotClient {
           (target, range) => this.gotoPosition(pathfinderBot, target, range),
           logHarvestingPort,
           getNearbyDroppedItemCollector(),
+          getCombatService(),
           () => scenarioGeneration === microBaseScenarioGeneration,
           () => priorityCoordinator.waitUntilTaskMayProceed(
             () => scenarioGeneration === microBaseScenarioGeneration,

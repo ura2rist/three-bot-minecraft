@@ -7,6 +7,7 @@ import { Logger } from '../../application/shared/ports/Logger';
 import { BotRallyPoint } from '../../domain/bot/entities/BotConfiguration';
 import { MineflayerLogHarvestingPort } from './MineflayerLogHarvestingPort';
 import { MineflayerNearbyDroppedItemCollector } from './MineflayerNearbyDroppedItemCollector';
+import { MineflayerCombatService } from './MineflayerCombatService';
 import { BotWithPathfinder } from './MineflayerPortsShared';
 
 const LOG_TO_PLANK_ITEM = new Map<string, string>([
@@ -83,6 +84,7 @@ export class MineflayerMicroBasePort implements MicroBasePort {
     private readonly gotoPosition: (target: Vec3, range: number) => Promise<void>,
     private readonly logHarvestingPort: MineflayerLogHarvestingPort,
     private readonly nearbyDroppedItemCollector: MineflayerNearbyDroppedItemCollector,
+    private readonly combatService: MineflayerCombatService,
     private readonly isScenarioActive: () => boolean,
     private readonly waitUntilTaskMayProceed: () => Promise<void>,
     private readonly isThreatResponseActive: () => boolean,
@@ -285,8 +287,7 @@ export class MineflayerMicroBasePort implements MicroBasePort {
         return;
       }
 
-      await this.bot.lookAt(sheep.position.offset(0, Math.max(sheep.height / 2, 0.5), 0), true);
-      this.bot.attack(sheep);
+      await this.combatService.attackTarget(sheep);
       await this.bot.waitForTicks(12);
     }
 

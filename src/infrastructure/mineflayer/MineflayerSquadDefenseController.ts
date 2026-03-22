@@ -1,6 +1,7 @@
 import { Entity } from 'prismarine-entity';
 import { BotActivityEvent } from '../../application/bot/events/BotActivityEvent';
 import { Logger } from '../../application/shared/ports/Logger';
+import { MineflayerCombatService } from './MineflayerCombatService';
 import { BotWithPathfinder } from './MineflayerPortsShared';
 
 export class MineflayerSquadDefenseController {
@@ -12,6 +13,7 @@ export class MineflayerSquadDefenseController {
     private readonly logger: Logger,
     private readonly friendlyUsernames: ReadonlySet<string>,
     private readonly gotoPosition: (target: { x: number; y: number; z: number }, range: number) => Promise<void>,
+    private readonly combatService: MineflayerCombatService,
     private readonly canInterruptWithThreatResponse: () => boolean,
     private readonly publishEvent: (event: BotActivityEvent) => Promise<void>,
   ) {}
@@ -53,6 +55,10 @@ export class MineflayerSquadDefenseController {
       return false;
     }
 
+    if (this.isFriendlySource(source)) {
+      return false;
+    }
+
     return this.isThreat(source);
   }
 
@@ -65,12 +71,32 @@ export class MineflayerSquadDefenseController {
   }
 
   private isThreat(entity: Entity): boolean {
+    if (this.isFriendlySource(entity)) {
+      return false;
+    }
+
     if (entity.type === 'player') {
       const username = entity.username;
       return typeof username === 'string' && !this.friendlyUsernames.has(username);
     }
 
     return entity.kind?.toLowerCase().includes('hostile') ?? false;
+  }
+
+  private isFriendlySource(entity: Entity): boolean {
+    if (this.isFriendlyEntity(entity)) {
+      return true;
+    }
+
+    const username = entity.username;
+
+    if (typeof username === 'string' && this.friendlyUsernames.has(username)) {
+      return true;
+    }
+
+    return Object.values(this.bot.players).some((player) => {
+      return player.entity?.id === entity.id && this.friendlyUsernames.has(player.username);
+    });
   }
 
   private engageThreat(source: Entity): Promise<void> {
@@ -93,11 +119,7 @@ export class MineflayerSquadDefenseController {
       return;
     }
 
-    const sword = this.bot.inventory.items().find((item) => item.name === 'wooden_sword');
-
-    if (sword) {
-      await this.bot.equip(sword, 'hand').catch(() => undefined);
-    }
+    await this.combatService.equipWeaponIfAvailable();
 
     this.logger.warn(
       `Detected a threat ${source.displayName ?? source.name ?? 'unknown'} near the squad. Engaging.`,
@@ -143,8 +165,7 @@ export class MineflayerSquadDefenseController {
           return;
         }
 
-        await this.bot.lookAt(source.position.offset(0, Math.max(source.height / 2, 0.5), 0), true);
-        this.bot.attack(source);
+        await this.combatService.attackTarget(source);
         await this.bot.waitForTicks(10);
       }
     } finally {
