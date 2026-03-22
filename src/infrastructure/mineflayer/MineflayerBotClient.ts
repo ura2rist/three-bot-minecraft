@@ -1,5 +1,7 @@
 import mineflayer from 'mineflayer';
 import { BotClient } from '../../application/bot/ports/BotClient';
+import { EstablishMicroBaseService } from '../../application/bot/services/EstablishMicroBaseService';
+import { DeterministicMicroBaseAssignmentPolicy } from '../../application/bot/services/DeterministicMicroBaseAssignmentPolicy';
 import { EnsureCraftingTableNearRallyPointService } from '../../application/bot/services/EnsureCraftingTableNearRallyPointService';
 import { RandomCraftingTableAssignmentPolicy } from '../../application/bot/services/RandomCraftingTableAssignmentPolicy';
 import { BotConfiguration } from '../../domain/bot/entities/BotConfiguration';
@@ -7,8 +9,10 @@ import { Logger } from '../../application/shared/ports/Logger';
 import { LightAuthBotAuthenticator } from './LightAuthBotAuthenticator';
 import { MineflayerCraftingTablePlacementPort } from './MineflayerCraftingTablePlacementPort';
 import { MineflayerItemCraftingPort } from './MineflayerItemCraftingPort';
+import { MineflayerMicroBasePort } from './MineflayerMicroBasePort';
 import { MineflayerNearbyDroppedItemCollector } from './MineflayerNearbyDroppedItemCollector';
 import { MineflayerLogHarvestingPort } from './MineflayerLogHarvestingPort';
+import { MineflayerSquadDefenseController } from './MineflayerSquadDefenseController';
 import type { BotWithPathfinder, PathfinderApi, PathfinderMovements } from './MineflayerPortsShared';
 
 const mineflayerPathfinder = require('../../../.vendor/mineflayer-pathfinder-master');
@@ -76,14 +80,22 @@ export class MineflayerBotClient implements BotClient {
     15,
   );
   private readonly craftingTableAssignmentPolicy = new RandomCraftingTableAssignmentPolicy();
+  private readonly microBaseAssignmentPolicy = new DeterministicMicroBaseAssignmentPolicy();
   private readonly supervisedBots = new Set<string>();
   private readonly reconnectTimers = new Map<string, NodeJS.Timeout>();
   private readonly reconnectingBots = new Set<string>();
+  private readonly friendlyUsernames = new Set<string>();
 
   constructor(private readonly logger: Logger) {}
 
   prepareFleet(configurations: readonly BotConfiguration[]): void {
     this.craftingTableAssignmentPolicy.prepareFleet(configurations);
+    this.microBaseAssignmentPolicy.prepareFleet(configurations);
+    this.friendlyUsernames.clear();
+
+    for (const configuration of configurations) {
+      this.friendlyUsernames.add(configuration.username);
+    }
 
     for (const configuration of configurations) {
       const assignedUsername = this.craftingTableAssignmentPolicy.getAssignedUsername(configuration);
@@ -155,10 +167,12 @@ export class MineflayerBotClient implements BotClient {
 
     const authenticator = new LightAuthBotAuthenticator(logger);
     let nearbyDroppedItemCollector: MineflayerNearbyDroppedItemCollector | null = null;
+    let squadDefenseController: MineflayerSquadDefenseController | null = null;
     let hasSpawned = false;
     let isAuthenticated = false;
     let startupCompleted = false;
     let reconnectScheduled = false;
+    let microBaseScenarioStarted = false;
     let spawnCount = 0;
     let configurationSettingsSent = false;
     let configurationFallbackTriggered = false;
@@ -213,6 +227,51 @@ export class MineflayerBotClient implements BotClient {
       );
       return nearbyDroppedItemCollector;
     };
+    const getSquadDefenseController = () => {
+      if (squadDefenseController) {
+        return squadDefenseController;
+      }
+
+      const pathfinderBot = this.requirePathfinderBot(bot);
+      squadDefenseController = new MineflayerSquadDefenseController(
+        pathfinderBot,
+        logger.child('defense'),
+        this.friendlyUsernames,
+        (target, range) => this.gotoPosition(pathfinderBot, target, range),
+      );
+      return squadDefenseController;
+    };
+    const startMicroBaseScenario = () => {
+      if (!configuration.rallyPoint || microBaseScenarioStarted) {
+        return;
+      }
+
+      microBaseScenarioStarted = true;
+
+      const pathfinderBot = this.requirePathfinderBot(bot);
+      const microBaseLogger = logger.child('microbase');
+      const logHarvestingPort = new MineflayerLogHarvestingPort(
+        pathfinderBot,
+        microBaseLogger,
+        (target, range) => this.gotoPosition(pathfinderBot, target, range),
+        getNearbyDroppedItemCollector(),
+      );
+      const microBaseService = new EstablishMicroBaseService(
+        this.microBaseAssignmentPolicy,
+        new MineflayerMicroBasePort(
+          pathfinderBot,
+          microBaseLogger,
+          (target, range) => this.gotoPosition(pathfinderBot, target, range),
+          logHarvestingPort,
+          getNearbyDroppedItemCollector(),
+        ),
+        microBaseLogger,
+      );
+
+      void microBaseService.execute(configuration).catch((error) => {
+        microBaseLogger.error('Failed to establish the micro-base scenario.', error);
+      });
+    };
     const startRallyNavigation = (force = false) => {
       if (!configuration.rallyPoint) {
         return;
@@ -236,23 +295,25 @@ export class MineflayerBotClient implements BotClient {
       rallyNavigationPromise = this.moveToRallyPoint(bot, configuration, logger)
         .then(async () => {
           const pathfinderBot = this.requirePathfinderBot(bot);
+          const logHarvestingPort = new MineflayerLogHarvestingPort(
+            pathfinderBot,
+            logger,
+            (target, range) => this.gotoPosition(pathfinderBot, target, range),
+            getNearbyDroppedItemCollector(),
+          );
           const ensureCraftingTableService = new EnsureCraftingTableNearRallyPointService(
             this.craftingTableAssignmentPolicy,
             new MineflayerCraftingTablePlacementPort(pathfinderBot, logger, (target, range) =>
               this.gotoPosition(pathfinderBot, target, range),
             ),
             new MineflayerItemCraftingPort(pathfinderBot, logger),
-            new MineflayerLogHarvestingPort(
-              pathfinderBot,
-              logger,
-              (target, range) => this.gotoPosition(pathfinderBot, target, range),
-              getNearbyDroppedItemCollector(),
-            ),
+            logHarvestingPort,
             logger,
           );
 
           try {
             await ensureCraftingTableService.execute(configuration);
+            startMicroBaseScenario();
           } catch (error) {
             logger.error('Failed to ensure a crafting table near the rally point.', error);
           }
@@ -291,12 +352,14 @@ export class MineflayerBotClient implements BotClient {
 
       if (isAuthenticated) {
         getNearbyDroppedItemCollector().start();
+        getSquadDefenseController().start();
         startRallyNavigation(true);
       }
     });
 
     bot.on('death', () => {
       nearbyDroppedItemCollector?.stop();
+      squadDefenseController?.stop();
       logger.warn('Bot died. Rally navigation will restart after respawn.');
       stopRallyNavigation('bot died');
     });
@@ -388,18 +451,21 @@ export class MineflayerBotClient implements BotClient {
 
     bot.on('end', (reason) => {
       nearbyDroppedItemCollector?.stop();
+      squadDefenseController?.stop();
       logger.info(`Bot connection ended: ${reason ?? 'unknown reason'}`);
       scheduleReconnect(`connection ended: ${reason ?? 'unknown reason'}`);
     });
 
     bot.on('kicked', (reason) => {
       nearbyDroppedItemCollector?.stop();
+      squadDefenseController?.stop();
       logger.error(`Bot was kicked: ${String(reason)}`);
       scheduleReconnect(`bot was kicked: ${this.stringifyError(reason)}`);
     });
 
     bot.on('error', (error) => {
       nearbyDroppedItemCollector?.stop();
+      squadDefenseController?.stop();
       logger.error('Mineflayer client error.', error);
       scheduleReconnect(`client error: ${error.message}`);
     });
@@ -415,6 +481,7 @@ export class MineflayerBotClient implements BotClient {
       }
 
       getNearbyDroppedItemCollector().start();
+      getSquadDefenseController().start();
 
       if (configuration.rallyPoint) {
         startupCompleted = true;
