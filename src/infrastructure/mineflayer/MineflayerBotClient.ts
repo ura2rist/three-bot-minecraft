@@ -272,6 +272,27 @@ export class MineflayerBotClient implements BotClient {
         microBaseLogger.error('Failed to establish the micro-base scenario.', error);
       });
     };
+    const runPostRallyScenario = async () => {
+      const pathfinderBot = this.requirePathfinderBot(bot);
+      const logHarvestingPort = new MineflayerLogHarvestingPort(
+        pathfinderBot,
+        logger,
+        (target, range) => this.gotoPosition(pathfinderBot, target, range),
+        getNearbyDroppedItemCollector(),
+      );
+      const ensureCraftingTableService = new EnsureCraftingTableNearRallyPointService(
+        this.craftingTableAssignmentPolicy,
+        new MineflayerCraftingTablePlacementPort(pathfinderBot, logger, (target, range) =>
+          this.gotoPosition(pathfinderBot, target, range),
+        ),
+        new MineflayerItemCraftingPort(pathfinderBot, logger),
+        logHarvestingPort,
+        logger,
+      );
+
+      await ensureCraftingTableService.execute(configuration);
+      startMicroBaseScenario();
+    };
     const startRallyNavigation = (force = false) => {
       if (!configuration.rallyPoint) {
         return;
@@ -285,45 +306,27 @@ export class MineflayerBotClient implements BotClient {
         return;
       }
 
-      if (!this.shouldMoveToRallyPoint(bot, configuration, logger)) {
-        return;
-      }
-
       const attempt = rallyNavigationAttempt + 1;
       rallyNavigationAttempt = attempt;
 
-      rallyNavigationPromise = this.moveToRallyPoint(bot, configuration, logger)
-        .then(async () => {
-          const pathfinderBot = this.requirePathfinderBot(bot);
-          const logHarvestingPort = new MineflayerLogHarvestingPort(
-            pathfinderBot,
-            logger,
-            (target, range) => this.gotoPosition(pathfinderBot, target, range),
-            getNearbyDroppedItemCollector(),
-          );
-          const ensureCraftingTableService = new EnsureCraftingTableNearRallyPointService(
-            this.craftingTableAssignmentPolicy,
-            new MineflayerCraftingTablePlacementPort(pathfinderBot, logger, (target, range) =>
-              this.gotoPosition(pathfinderBot, target, range),
-            ),
-            new MineflayerItemCraftingPort(pathfinderBot, logger),
-            logHarvestingPort,
-            logger,
-          );
+      const shouldMoveToRallyPoint = this.shouldMoveToRallyPoint(bot, configuration, logger);
 
-          try {
-            await ensureCraftingTableService.execute(configuration);
-            startMicroBaseScenario();
-          } catch (error) {
-            logger.error('Failed to ensure a crafting table near the rally point.', error);
+      rallyNavigationPromise = Promise.resolve()
+        .then(async () => {
+          if (shouldMoveToRallyPoint) {
+            await this.moveToRallyPoint(bot, configuration, logger);
+          } else {
+            logger.info('Proceeding with the post-rally scenario without movement.');
           }
+
+          await runPostRallyScenario();
         })
         .catch((error) => {
           if (attempt !== rallyNavigationAttempt) {
             return;
           }
 
-          logger.error('Failed to reach the rally point after spawn.', error);
+          logger.error('Failed to complete the post-spawn rally scenario.', error);
         })
         .finally(() => {
           if (attempt === rallyNavigationAttempt) {
