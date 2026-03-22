@@ -275,6 +275,11 @@ export class MineflayerBotClient implements BotClient {
       );
 
       void microBaseService.execute(configuration).catch((error) => {
+        if (this.isFriendlyMissingResourceError(error)) {
+          microBaseLogger.warn(this.stringifyError(error));
+          return;
+        }
+
         microBaseLogger.error('Failed to establish the micro-base scenario.', error);
       });
     };
@@ -333,6 +338,11 @@ export class MineflayerBotClient implements BotClient {
         })
         .catch((error) => {
           if (attempt !== rallyNavigationAttempt) {
+            return;
+          }
+
+          if (this.isFriendlyMissingResourceError(error)) {
+            logger.warn(this.stringifyError(error));
             return;
           }
 
@@ -982,6 +992,10 @@ export class MineflayerBotClient implements BotClient {
     }
 
     return String(error);
+  }
+
+  private isFriendlyMissingResourceError(error: unknown): boolean {
+    return this.stringifyError(error).startsWith('Ой, не могу найти ');
   }
 
   private async disconnectBot(bot: BotWithClient, logger: Logger): Promise<void> {

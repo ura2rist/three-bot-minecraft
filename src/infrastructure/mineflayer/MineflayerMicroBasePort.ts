@@ -89,15 +89,15 @@ export class MineflayerMicroBasePort implements MicroBasePort {
       const craftedStick = await this.craftSingleItem('stick', null);
 
       if (!craftedStick) {
-        throw new Error('Failed to craft sticks for a wooden sword.');
+        throw this.createMissingThingError('палочки для деревянного меча');
       }
     }
 
     const craftingTable = this.requireNearbyCraftingTable(rallyPoint);
-    const craftedSword = await this.craftSingleItem('wooden_sword', craftingTable);
+    const craftedSword = await this.craftSingleItem('wooden_sword', craftingTable, rallyPoint);
 
     if (!craftedSword) {
-      throw new Error('Failed to craft a wooden sword near the rally point.');
+      throw this.createMissingThingError('деревянный меч');
     }
 
     this.logger.info('Crafted a wooden sword for squad defense.');
@@ -111,7 +111,7 @@ export class MineflayerMicroBasePort implements MicroBasePort {
     const craftedBeds = await this.craftBeds(rallyPoint, 3);
 
     if (craftedBeds < 3) {
-      throw new Error(`Failed to craft three beds. Crafted ${craftedBeds}.`);
+      throw this.createMissingThingError('три кровати');
     }
 
     await this.ensureDoorCrafted(rallyPoint);
@@ -144,7 +144,7 @@ export class MineflayerMicroBasePort implements MicroBasePort {
       const sheep = this.findNearestSheep();
 
       if (!sheep) {
-        throw new Error(`No sheep were found within ${this.sheepSearchRadius} blocks of the bot.`);
+        throw this.createMissingThingError('овцу рядом');
       }
 
       this.logger.info(
@@ -163,7 +163,7 @@ export class MineflayerMicroBasePort implements MicroBasePort {
 
     for (let attempt = 0; this.countTotalPlanks() < minPlanks; attempt += 1) {
       if (attempt >= 24) {
-        throw new Error(`Failed to gather enough logs to reach ${minPlanks} planks.`);
+        throw this.createMissingThingError(`достаточно брёвен для ${minPlanks} досок`);
       }
 
       this.logger.info(`Need at least ${minPlanks} planks. Gathering another log.`);
@@ -213,7 +213,7 @@ export class MineflayerMicroBasePort implements MicroBasePort {
         continue;
       }
 
-      const craftedDoor = await this.craftSingleItem(doorName, craftingTable);
+      const craftedDoor = await this.craftSingleItem(doorName, craftingTable, rallyPoint);
 
       if (craftedDoor) {
         this.logger.info(`Crafted a ${doorName} for the shelter entrance.`);
@@ -221,7 +221,7 @@ export class MineflayerMicroBasePort implements MicroBasePort {
       }
     }
 
-    throw new Error('Failed to craft a wooden door for the shelter.');
+    throw this.createMissingThingError('деревянную дверь');
   }
 
   private async craftBeds(rallyPoint: BotRallyPoint, targetBeds: number): Promise<number> {
@@ -229,7 +229,7 @@ export class MineflayerMicroBasePort implements MicroBasePort {
 
     for (const [woolName, bedName] of WOOL_TO_BED_ITEM.entries()) {
       while (this.countInventoryBeds() < targetBeds && this.countItem(woolName) >= 3) {
-        const crafted = await this.craftSingleItem(bedName, craftingTable);
+        const crafted = await this.craftSingleItem(bedName, craftingTable, rallyPoint);
 
         if (!crafted) {
           break;
@@ -266,7 +266,7 @@ export class MineflayerMicroBasePort implements MicroBasePort {
     }
 
     if (sheep.isValid) {
-      throw new Error('Failed to kill a sheep after repeated attack attempts.');
+      throw new Error('Не получилось добить овцу после нескольких попыток.');
     }
   }
 
@@ -357,14 +357,14 @@ export class MineflayerMicroBasePort implements MicroBasePort {
       }
     }
 
-    throw new Error(`Failed to place a bed at ${position.x} ${position.y} ${position.z}.`);
+    throw this.createMissingThingError(`место для кровати в точке ${position.x} ${position.y} ${position.z}`);
   }
 
   private async placeDoor(position: Vec3): Promise<void> {
     const doorItem = this.findAnyInventoryDoor();
 
     if (!doorItem) {
-      throw new Error('No wooden door is available in the inventory.');
+      throw this.createMissingThingError('деревянную дверь в инвентаре');
     }
 
     await this.placeBlockFromInventory(position, doorItem, new Set([doorItem.name]), Math.PI);
@@ -374,7 +374,7 @@ export class MineflayerMicroBasePort implements MicroBasePort {
     const plankItem = this.findAnyInventoryPlank();
 
     if (!plankItem) {
-      throw new Error('No planks are available while building the shelter.');
+      throw this.createMissingThingError('доски в инвентаре');
     }
 
     await this.placeBlockFromInventory(position, plankItem, new Set(PLANK_ITEM_NAMES));
@@ -396,7 +396,7 @@ export class MineflayerMicroBasePort implements MicroBasePort {
     const placement = this.findPlacementReference(position);
 
     if (!placement) {
-      throw new Error(`No placement reference is available for ${position.x} ${position.y} ${position.z}.`);
+      throw this.createMissingThingError(`опору для установки блока в точке ${position.x} ${position.y} ${position.z}`);
     }
 
     await this.bot.equip(item, 'hand');
@@ -456,7 +456,7 @@ export class MineflayerMicroBasePort implements MicroBasePort {
       const beds = this.findPlacedBedsNearRallyPoint(rallyPoint);
 
       if (beds.length === 0) {
-        throw new Error('No placed beds were found near the rally point.');
+        throw this.createMissingThingError('кровать рядом с точкой сбора');
       }
 
       if (!this.isSleepWindow()) {
@@ -511,7 +511,7 @@ export class MineflayerMicroBasePort implements MicroBasePort {
 
         if (Date.now() >= deadline) {
           cleanup();
-          reject(new Error('Timed out while waiting for a nearby crafting table.'));
+          reject(this.createMissingThingError('верстак рядом с точкой сбора'));
         }
       }, 500);
 
@@ -525,7 +525,7 @@ export class MineflayerMicroBasePort implements MicroBasePort {
     const craftingTable = this.findNearbyCraftingTable(rallyPoint);
 
     if (!craftingTable) {
-      throw new Error('A nearby crafting table is required but was not found.');
+      throw this.createMissingThingError('верстак рядом с точкой сбора');
     }
 
     return craftingTable;
@@ -613,21 +613,36 @@ export class MineflayerMicroBasePort implements MicroBasePort {
     return this.bot.inventory.items().find((item) => item.name === itemName);
   }
 
-  private async craftSingleItem(itemName: string, craftingTable: Block | null): Promise<boolean> {
+  private async craftSingleItem(
+    itemName: string,
+    craftingTable: Block | null,
+    rallyPoint?: BotRallyPoint,
+  ): Promise<boolean> {
     const itemId = this.bot.registry.itemsByName[itemName]?.id;
 
     if (itemId === undefined) {
       throw new Error(`Item id for "${itemName}" is unavailable in the current registry.`);
     }
 
-    const recipe = this.bot.recipesFor(itemId, null, 1, craftingTable)[0];
+    const craftingTarget =
+      craftingTable && rallyPoint ? await this.prepareCraftingTableForUse(rallyPoint) : craftingTable;
+    const recipe = this.bot.recipesFor(itemId, null, 1, craftingTarget)[0];
 
     if (!recipe) {
       return false;
     }
 
-    await this.bot.craft(recipe, 1, craftingTable ?? undefined);
+    await this.bot.craft(recipe, 1, craftingTarget ?? undefined);
     return true;
+  }
+
+  private async prepareCraftingTableForUse(rallyPoint: BotRallyPoint): Promise<Block> {
+    await this.gotoPosition(this.toVec3(rallyPoint), 2);
+
+    const craftingTable = this.requireNearbyCraftingTable(rallyPoint);
+    await this.gotoPosition(craftingTable.position, 2);
+
+    return this.requireNearbyCraftingTable(rallyPoint);
   }
 
   private toVec3(rallyPoint: BotRallyPoint): Vec3 {
@@ -640,5 +655,9 @@ export class MineflayerMicroBasePort implements MicroBasePort {
     }
 
     return String(error);
+  }
+
+  private createMissingThingError(thing: string): Error {
+    return new Error(`Ой, не могу найти ${thing}.`);
   }
 }
