@@ -3,6 +3,7 @@ import { BotActivityEvent } from '../../application/bot/events/BotActivityEvent'
 import { BotPriorityLifecycleSubscriber } from '../../application/bot/subscribers/BotPriorityLifecycleSubscriber';
 import { BotThreatPrioritySubscriber } from '../../application/bot/subscribers/BotThreatPrioritySubscriber';
 import { BotPriorityCoordinator } from '../../application/bot/services/BotPriorityCoordinator';
+import { SquadWeaponReadinessTracker } from '../../application/bot/services/SquadWeaponReadinessTracker';
 import { BotClient } from '../../application/bot/ports/BotClient';
 import { EstablishMicroBaseService } from '../../application/bot/services/EstablishMicroBaseService';
 import { DeterministicMicroBaseAssignmentPolicy } from '../../application/bot/services/DeterministicMicroBaseAssignmentPolicy';
@@ -86,6 +87,7 @@ export class MineflayerBotClient implements BotClient {
   );
   private readonly craftingTableAssignmentPolicy = new RandomCraftingTableAssignmentPolicy();
   private readonly microBaseAssignmentPolicy = new DeterministicMicroBaseAssignmentPolicy();
+  private readonly squadWeaponReadinessTracker = new SquadWeaponReadinessTracker();
   private readonly supervisedBots = new Set<string>();
   private readonly reconnectTimers = new Map<string, NodeJS.Timeout>();
   private readonly reconnectingBots = new Set<string>();
@@ -96,6 +98,7 @@ export class MineflayerBotClient implements BotClient {
   prepareFleet(configurations: readonly BotConfiguration[]): void {
     this.craftingTableAssignmentPolicy.prepareFleet(configurations);
     this.microBaseAssignmentPolicy.prepareFleet(configurations);
+    this.squadWeaponReadinessTracker.reset();
     this.friendlyUsernames.clear();
 
     for (const configuration of configurations) {
@@ -257,6 +260,7 @@ export class MineflayerBotClient implements BotClient {
         pathfinderBot,
         logger.child('pickup'),
         (target, range) => this.gotoPosition(pathfinderBot, target, range),
+        () => priorityCoordinator.getCurrentTask() === 'idle',
       );
       return nearbyDroppedItemCollector;
     };
@@ -308,6 +312,9 @@ export class MineflayerBotClient implements BotClient {
         ),
         microBaseLogger,
         eventBus,
+        this.squadWeaponReadinessTracker,
+        [...this.friendlyUsernames],
+        () => scenarioGeneration === microBaseScenarioGeneration,
       );
 
       void microBaseService.execute(configuration).catch((error) => {
@@ -449,6 +456,7 @@ export class MineflayerBotClient implements BotClient {
     bot.on('death', () => {
       nearbyDroppedItemCollector?.stop();
       squadDefenseController?.stop();
+      this.squadWeaponReadinessTracker.clearReady(configuration.username);
       void publishEvent({
         type: 'bot.died',
         payload: {
@@ -550,6 +558,7 @@ export class MineflayerBotClient implements BotClient {
     bot.on('end', (reason) => {
       nearbyDroppedItemCollector?.stop();
       squadDefenseController?.stop();
+      this.squadWeaponReadinessTracker.clearReady(configuration.username);
       void publishEvent({
         type: 'bot.died',
         payload: {
@@ -565,6 +574,7 @@ export class MineflayerBotClient implements BotClient {
     bot.on('kicked', (reason) => {
       nearbyDroppedItemCollector?.stop();
       squadDefenseController?.stop();
+      this.squadWeaponReadinessTracker.clearReady(configuration.username);
       void publishEvent({
         type: 'bot.died',
         payload: {
@@ -580,6 +590,7 @@ export class MineflayerBotClient implements BotClient {
     bot.on('error', (error) => {
       nearbyDroppedItemCollector?.stop();
       squadDefenseController?.stop();
+      this.squadWeaponReadinessTracker.clearReady(configuration.username);
       void publishEvent({
         type: 'bot.died',
         payload: {

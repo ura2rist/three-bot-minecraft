@@ -4,6 +4,7 @@ import { Logger } from '../../shared/ports/Logger';
 import { EventBus } from '../../shared/events/EventBus';
 import { MicroBasePort } from '../ports/MicroBasePort';
 import { DeterministicMicroBaseAssignmentPolicy } from './DeterministicMicroBaseAssignmentPolicy';
+import { SquadWeaponReadinessTracker } from './SquadWeaponReadinessTracker';
 
 export class EstablishMicroBaseService {
   constructor(
@@ -11,6 +12,9 @@ export class EstablishMicroBaseService {
     private readonly microBasePort: MicroBasePort,
     private readonly logger: Logger,
     private readonly eventBus: EventBus<BotActivityEvent>,
+    private readonly squadWeaponReadinessTracker: SquadWeaponReadinessTracker,
+    private readonly squadUsernames: readonly string[],
+    private readonly isScenarioActive: () => boolean,
   ) {}
 
   async execute(configuration: BotConfiguration): Promise<void> {
@@ -32,6 +36,7 @@ export class EstablishMicroBaseService {
 
     this.logger.info('Ensuring a wooden sword before the micro-base scenario.');
     await this.microBasePort.ensureWoodenSwordNearRallyPoint(configuration.rallyPoint);
+    this.squadWeaponReadinessTracker.markReady(configuration.username);
 
     const task: BotTaskName = this.assignmentPolicy.isLeader(configuration)
       ? 'resource_gathering'
@@ -47,6 +52,18 @@ export class EstablishMicroBaseService {
 
     try {
       if (this.assignmentPolicy.isLeader(configuration)) {
+        if (!this.squadWeaponReadinessTracker.areAllReady(this.squadUsernames)) {
+          this.logger.info('Waiting for the whole squad to equip wooden swords before starting sheep gathering.');
+          await this.squadWeaponReadinessTracker.waitUntilAllReady(
+            this.squadUsernames,
+            this.isScenarioActive,
+          );
+        }
+
+        if (!this.isScenarioActive()) {
+          return;
+        }
+
         this.logger.info('This bot is the micro-base leader. Starting the leader scenario.');
         await this.microBasePort.establishAtRallyPoint(configuration.rallyPoint);
         return;

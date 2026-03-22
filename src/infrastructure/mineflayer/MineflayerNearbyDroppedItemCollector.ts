@@ -22,6 +22,7 @@ export class MineflayerNearbyDroppedItemCollector {
     private readonly bot: BotWithPathfinder,
     private readonly logger: Logger,
     private readonly gotoPosition: (target: Vec3, range: number) => Promise<void>,
+    private readonly mayCollectInBackground: () => boolean = () => true,
   ) {}
 
   start(): void {
@@ -30,6 +31,10 @@ export class MineflayerNearbyDroppedItemCollector {
     }
 
     this.intervalId = setInterval(() => {
+      if (!this.mayCollectInBackground()) {
+        return;
+      }
+
       void this.collectAroundBot().catch((error) => {
         this.logger.error('Failed to collect nearby dropped items.', error);
       });
