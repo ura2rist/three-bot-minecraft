@@ -60,10 +60,18 @@ const PLANK_ITEM_NAMES = [...PLANK_TO_DOOR_ITEM.keys()];
 const BED_ITEM_NAMES = [...WOOL_TO_BED_ITEM.values()];
 const BED_BLOCK_NAMES = new Set([...BED_ITEM_NAMES, 'bed']);
 
+export class MicroBaseScenarioCancelledError extends Error {
+  constructor() {
+    super('Micro-base scenario was cancelled.');
+  }
+}
+
 export class MineflayerMicroBasePort implements MicroBasePort {
   private readonly craftingTableSearchRadius = 4;
   private readonly sheepSearchRadius = 64;
   private readonly sheepPickupRange = 6;
+  private readonly sheepSearchStepDistance = 12;
+  private readonly sheepSearchPauseTicks = 10;
   private readonly woodTargetPlanks = 72;
   private readonly houseWidth = 5;
   private readonly houseLength = 5;
@@ -75,9 +83,11 @@ export class MineflayerMicroBasePort implements MicroBasePort {
     private readonly gotoPosition: (target: Vec3, range: number) => Promise<void>,
     private readonly logHarvestingPort: MineflayerLogHarvestingPort,
     private readonly nearbyDroppedItemCollector: MineflayerNearbyDroppedItemCollector,
+    private readonly isScenarioActive: () => boolean,
   ) {}
 
   async ensureWoodenSwordNearRallyPoint(rallyPoint: BotRallyPoint): Promise<void> {
+    this.ensureScenarioActive();
     if (this.findInventoryItem('wooden_sword')) {
       return;
     }
@@ -104,6 +114,7 @@ export class MineflayerMicroBasePort implements MicroBasePort {
   }
 
   async establishAtRallyPoint(rallyPoint: BotRallyPoint): Promise<void> {
+    this.ensureScenarioActive();
     await this.waitForNearbyCraftingTable(rallyPoint);
     await this.ensureBedsCraftable(rallyPoint, 3);
     await this.ensurePlanksAvailable(this.woodTargetPlanks);
@@ -121,7 +132,9 @@ export class MineflayerMicroBasePort implements MicroBasePort {
   }
 
   async supportLeader(leaderUsername: string, rallyPoint: BotRallyPoint): Promise<void> {
+    this.ensureScenarioActive();
     while (!this.bot.isSleeping) {
+      this.ensureScenarioActive();
       if (this.countPlacedBedBlocksNearRallyPoint(rallyPoint) >= 6) {
         await this.sleepUntilSpawnIsSet(rallyPoint);
         return;
@@ -141,10 +154,11 @@ export class MineflayerMicroBasePort implements MicroBasePort {
 
   private async ensureBedsCraftable(rallyPoint: BotRallyPoint, targetBeds: number): Promise<void> {
     while (this.countInventoryBeds() + this.countCraftableBeds() < targetBeds) {
-      const sheep = this.findNearestSheep();
+      this.ensureScenarioActive();
+      const sheep = await this.findNearestSheepOrSearchAroundRallyPoint(rallyPoint);
 
       if (!sheep) {
-        throw this.createMissingThingError('овцу рядом');
+        throw this.createMissingThingError('овцу даже после обхода вокруг точки сбора');
       }
 
       this.logger.info(
@@ -162,6 +176,7 @@ export class MineflayerMicroBasePort implements MicroBasePort {
     await this.craftAllInventoryLogsIntoPlanks();
 
     for (let attempt = 0; this.countTotalPlanks() < minPlanks; attempt += 1) {
+      this.ensureScenarioActive();
       if (attempt >= 24) {
         throw this.createMissingThingError(`достаточно брёвен для ${minPlanks} досок`);
       }
@@ -176,6 +191,7 @@ export class MineflayerMicroBasePort implements MicroBasePort {
     let craftedAny = false;
 
     while (true) {
+      this.ensureScenarioActive();
       let craftedDuringPass = false;
 
       for (const [logItemName, plankItemName] of LOG_TO_PLANK_ITEM.entries()) {
@@ -242,6 +258,7 @@ export class MineflayerMicroBasePort implements MicroBasePort {
 
   private async huntSheep(sheep: Entity): Promise<void> {
     for (let attempt = 0; attempt < 10; attempt += 1) {
+      this.ensureScenarioActive();
       if (!sheep.isValid) {
         return;
       }
@@ -253,7 +270,7 @@ export class MineflayerMicroBasePort implements MicroBasePort {
       const distance = this.bot.entity.position.distanceTo(sheep.position);
 
       if (distance > 3) {
-        await this.gotoPosition(sheep.position, 2);
+        await this.navigateTo(sheep.position, 2);
       }
 
       if (!sheep.isValid) {
@@ -271,6 +288,7 @@ export class MineflayerMicroBasePort implements MicroBasePort {
   }
 
   private async followLeader(leader: Entity): Promise<void> {
+    this.ensureScenarioActive();
     if (!this.bot.entity) {
       return;
     }
@@ -282,10 +300,15 @@ export class MineflayerMicroBasePort implements MicroBasePort {
       return;
     }
 
-    await this.gotoPosition(leader.position, 2).catch(() => undefined);
+    await this.navigateTo(leader.position, 2).catch((error) => {
+      if (error instanceof MicroBaseScenarioCancelledError) {
+        throw error;
+      }
+    });
   }
 
   private async buildShelter(rallyPoint: BotRallyPoint): Promise<void> {
+    this.ensureScenarioActive();
     const origin = new Vec3(rallyPoint.x - 2, rallyPoint.y, rallyPoint.z - 2);
 
     this.logger.info(
@@ -325,6 +348,7 @@ export class MineflayerMicroBasePort implements MicroBasePort {
   }
 
   private async placeThreeBeds(rallyPoint: BotRallyPoint): Promise<void> {
+    this.ensureScenarioActive();
     if (this.countPlacedBedBlocksNearRallyPoint(rallyPoint) >= 6) {
       return;
     }
@@ -386,6 +410,7 @@ export class MineflayerMicroBasePort implements MicroBasePort {
     allowedExistingBlockNames: ReadonlySet<string>,
     yaw?: number,
   ): Promise<void> {
+    this.ensureScenarioActive();
     const currentBlock = this.bot.blockAt(position);
 
     if (currentBlock && allowedExistingBlockNames.has(currentBlock.name)) {
@@ -400,7 +425,7 @@ export class MineflayerMicroBasePort implements MicroBasePort {
     }
 
     await this.bot.equip(item, 'hand');
-    await this.gotoPosition(placement.referenceBlock.position, 2);
+    await this.navigateTo(placement.referenceBlock.position, 2);
 
     if (yaw !== undefined) {
       await this.bot.look(yaw, 0, true);
@@ -453,6 +478,7 @@ export class MineflayerMicroBasePort implements MicroBasePort {
 
   private async sleepUntilSpawnIsSet(rallyPoint: BotRallyPoint): Promise<void> {
     while (!this.bot.isSleeping) {
+      this.ensureScenarioActive();
       const beds = this.findPlacedBedsNearRallyPoint(rallyPoint);
 
       if (beds.length === 0) {
@@ -466,7 +492,7 @@ export class MineflayerMicroBasePort implements MicroBasePort {
 
       for (const bed of beds) {
         try {
-          await this.gotoPosition(bed.position, 2);
+          await this.navigateTo(bed.position, 2);
           await this.bot.sleep(bed);
           this.logger.info(
             `Sleeping in a bed at ${bed.position.x} ${bed.position.y} ${bed.position.z} to set the spawn point.`,
@@ -492,6 +518,82 @@ export class MineflayerMicroBasePort implements MicroBasePort {
         this.bot.entity.position.distanceTo(entity.position) <= this.sheepSearchRadius
       );
     });
+  }
+
+  private async findNearestSheepOrSearchAroundRallyPoint(rallyPoint: BotRallyPoint): Promise<Entity | null> {
+    this.ensureScenarioActive();
+    const nearbySheep = this.findNearestSheep();
+
+    if (nearbySheep) {
+      return nearbySheep;
+    }
+
+    this.logger.info('No sheep are visible nearby. Searching around the rally point.');
+
+    for (const searchPoint of this.getSheepSearchPoints(rallyPoint)) {
+      this.ensureScenarioActive();
+      try {
+        this.logger.info(
+          `Searching for sheep near ${searchPoint.x} ${searchPoint.y} ${searchPoint.z}.`,
+        );
+        await this.navigateTo(searchPoint, 3);
+      } catch (error) {
+        if (error instanceof MicroBaseScenarioCancelledError) {
+          throw error;
+        }
+
+        this.logger.warn(
+          `Could not inspect sheep-search point ${searchPoint.x} ${searchPoint.y} ${searchPoint.z}: ${this.stringifyError(error)}.`,
+        );
+        continue;
+      }
+
+      await this.bot.waitForTicks(this.sheepSearchPauseTicks);
+      const sheep = this.findNearestSheep();
+
+      if (sheep) {
+        this.logger.info(
+          `Found a sheep near ${sheep.position.x.toFixed(1)} ${sheep.position.y.toFixed(1)} ${sheep.position.z.toFixed(1)} during the search route.`,
+        );
+        return sheep;
+      }
+    }
+
+    return null;
+  }
+
+  private getSheepSearchPoints(rallyPoint: BotRallyPoint): Vec3[] {
+    const searchPoints: Vec3[] = [];
+    const seen = new Set<string>();
+
+    for (
+      let distance = this.sheepSearchStepDistance;
+      distance <= this.sheepSearchRadius;
+      distance += this.sheepSearchStepDistance
+    ) {
+      for (let offset = -distance; offset <= distance; offset += this.sheepSearchStepDistance) {
+        const perimeterOffsets: Array<[number, number]> = [
+          [offset, -distance],
+          [offset, distance],
+          [-distance, offset],
+          [distance, offset],
+        ];
+
+        for (const [dx, dz] of perimeterOffsets) {
+          const point = new Vec3(rallyPoint.x + dx, rallyPoint.y, rallyPoint.z + dz);
+          const key = `${point.x}:${point.y}:${point.z}`;
+
+          if (seen.has(key)) {
+            continue;
+          }
+
+          seen.add(key);
+          searchPoints.push(point);
+        }
+      }
+    }
+
+    return searchPoints;
   }
 
   private findLeaderEntity(leaderUsername: string): Entity | null {
@@ -618,6 +720,7 @@ export class MineflayerMicroBasePort implements MicroBasePort {
     craftingTable: Block | null,
     rallyPoint?: BotRallyPoint,
   ): Promise<boolean> {
+    this.ensureScenarioActive();
     const itemId = this.bot.registry.itemsByName[itemName]?.id;
 
     if (itemId === undefined) {
@@ -637,10 +740,10 @@ export class MineflayerMicroBasePort implements MicroBasePort {
   }
 
   private async prepareCraftingTableForUse(rallyPoint: BotRallyPoint): Promise<Block> {
-    await this.gotoPosition(this.toVec3(rallyPoint), 2);
+    await this.navigateTo(this.toVec3(rallyPoint), 2);
 
     const craftingTable = this.requireNearbyCraftingTable(rallyPoint);
-    await this.gotoPosition(craftingTable.position, 2);
+    await this.navigateTo(craftingTable.position, 2);
 
     return this.requireNearbyCraftingTable(rallyPoint);
   }
@@ -659,5 +762,27 @@ export class MineflayerMicroBasePort implements MicroBasePort {
 
   private createMissingThingError(thing: string): Error {
     return new Error(`Ой, не могу найти ${thing}.`);
+  }
+
+  private ensureScenarioActive(): void {
+    if (!this.isScenarioActive()) {
+      throw new MicroBaseScenarioCancelledError();
+    }
+  }
+
+  private async navigateTo(target: Vec3, range: number): Promise<void> {
+    this.ensureScenarioActive();
+
+    try {
+      await this.gotoPosition(target, range);
+    } catch (error) {
+      if (!this.isScenarioActive()) {
+        throw new MicroBaseScenarioCancelledError();
+      }
+
+      throw error;
+    }
+
+    this.ensureScenarioActive();
   }
 }

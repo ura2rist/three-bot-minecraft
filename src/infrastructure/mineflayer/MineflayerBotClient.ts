@@ -9,7 +9,7 @@ import { Logger } from '../../application/shared/ports/Logger';
 import { LightAuthBotAuthenticator } from './LightAuthBotAuthenticator';
 import { MineflayerCraftingTablePlacementPort } from './MineflayerCraftingTablePlacementPort';
 import { MineflayerItemCraftingPort } from './MineflayerItemCraftingPort';
-import { MineflayerMicroBasePort } from './MineflayerMicroBasePort';
+import { MicroBaseScenarioCancelledError, MineflayerMicroBasePort } from './MineflayerMicroBasePort';
 import { MineflayerNearbyDroppedItemCollector } from './MineflayerNearbyDroppedItemCollector';
 import { MineflayerLogHarvestingPort } from './MineflayerLogHarvestingPort';
 import { MineflayerSquadDefenseController } from './MineflayerSquadDefenseController';
@@ -179,6 +179,7 @@ export class MineflayerBotClient implements BotClient {
     let startupCompleted = false;
     let reconnectScheduled = false;
     let microBaseScenarioStarted = false;
+    let microBaseScenarioGeneration = 0;
     let spawnCount = 0;
     let configurationSettingsSent = false;
     let configurationFallbackTriggered = false;
@@ -211,6 +212,12 @@ export class MineflayerBotClient implements BotClient {
       rallyNavigationPromise = null;
       bot.pathfinder?.stop();
       logger.info(`Stopped rally navigation: ${reason}.`);
+    };
+    const cancelScenarios = (reason: string) => {
+      microBaseScenarioGeneration += 1;
+      microBaseScenarioStarted = false;
+      bot.pathfinder?.stop();
+      logger.info(`Stopped active scenarios: ${reason}.`);
     };
     const scheduleReconnect = (reason: string) => {
       if (!startupCompleted || reconnectScheduled) {
@@ -253,6 +260,7 @@ export class MineflayerBotClient implements BotClient {
       }
 
       microBaseScenarioStarted = true;
+      const scenarioGeneration = microBaseScenarioGeneration;
 
       const pathfinderBot = this.requirePathfinderBot(bot);
       const microBaseLogger = logger.child('microbase');
@@ -270,11 +278,17 @@ export class MineflayerBotClient implements BotClient {
           (target, range) => this.gotoPosition(pathfinderBot, target, range),
           logHarvestingPort,
           getNearbyDroppedItemCollector(),
+          () => scenarioGeneration === microBaseScenarioGeneration,
         ),
         microBaseLogger,
       );
 
       void microBaseService.execute(configuration).catch((error) => {
+        if (error instanceof MicroBaseScenarioCancelledError) {
+          microBaseLogger.info('Micro-base scenario was cancelled and will restart from the beginning if needed.');
+          return;
+        }
+
         if (this.isFriendlyMissingResourceError(error)) {
           microBaseLogger.warn(this.stringifyError(error));
           return;
@@ -383,6 +397,7 @@ export class MineflayerBotClient implements BotClient {
     bot.on('death', () => {
       nearbyDroppedItemCollector?.stop();
       squadDefenseController?.stop();
+      cancelScenarios('bot died');
       logger.warn('Bot died. Rally navigation will restart after respawn.');
       stopRallyNavigation('bot died');
     });
@@ -475,6 +490,7 @@ export class MineflayerBotClient implements BotClient {
     bot.on('end', (reason) => {
       nearbyDroppedItemCollector?.stop();
       squadDefenseController?.stop();
+      cancelScenarios('connection ended');
       logger.info(`Bot connection ended: ${reason ?? 'unknown reason'}`);
       scheduleReconnect(`connection ended: ${reason ?? 'unknown reason'}`);
     });
@@ -482,6 +498,7 @@ export class MineflayerBotClient implements BotClient {
     bot.on('kicked', (reason) => {
       nearbyDroppedItemCollector?.stop();
       squadDefenseController?.stop();
+      cancelScenarios('bot was kicked');
       logger.error(`Bot was kicked: ${String(reason)}`);
       scheduleReconnect(`bot was kicked: ${this.stringifyError(reason)}`);
     });
@@ -489,6 +506,7 @@ export class MineflayerBotClient implements BotClient {
     bot.on('error', (error) => {
       nearbyDroppedItemCollector?.stop();
       squadDefenseController?.stop();
+      cancelScenarios('client error');
       logger.error('Mineflayer client error.', error);
       scheduleReconnect(`client error: ${error.message}`);
     });
