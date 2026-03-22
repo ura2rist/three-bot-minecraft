@@ -7,7 +7,9 @@
     "build": "node -e \"require('fs').rmSync('dist', { recursive: true, force: true })\" && node ./node_modules/typescript/bin/tsc -p tsconfig.json",
     "dev": "node ./node_modules/ts-node/dist/bin.js src/main.ts",
     "start": "node dist/main.js",
-    "typecheck": "node ./node_modules/typescript/bin/tsc --noEmit -p tsconfig.json"
+    "typecheck": "node ./node_modules/typescript/bin/tsc --noEmit -p tsconfig.json",
+    "test": "node scripts/run-tests.js",
+    "test:watch": "node scripts/run-tests.js --watch"
   },
   "keywords": [
     "minecraft",

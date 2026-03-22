@@ -6,10 +6,12 @@ import { MicroBasePort } from '../../application/bot/ports/MicroBasePort';
 import { Logger } from '../../application/shared/ports/Logger';
 import { BotRallyPoint } from '../../domain/bot/entities/BotConfiguration';
 import { BotRole } from '../../domain/bot/entities/BotRole';
+import { BedAssignmentService } from '../../application/bot/services/BedAssignmentService';
 import { MineflayerLogHarvestingPort } from './MineflayerLogHarvestingPort';
 import { MineflayerNearbyDroppedItemCollector } from './MineflayerNearbyDroppedItemCollector';
 import { MineflayerCombatService } from './MineflayerCombatService';
 import { BotWithPathfinder } from './MineflayerPortsShared';
+import { BlockPosition, ShelterLayoutService } from '../../application/bot/services/ShelterLayoutService';
 
 const mineflayerPathfinder = require('../../../.vendor/mineflayer-pathfinder-master');
 const GoalPlaceBlock = mineflayerPathfinder.goals.GoalPlaceBlock as new (
@@ -76,7 +78,6 @@ const PLANK_ITEM_NAMES = [...PLANK_TO_DOOR_ITEM.keys()];
 const DOOR_ITEM_NAMES = [...PLANK_TO_DOOR_ITEM.values()];
 const BED_ITEM_NAMES = [...WOOL_TO_BED_ITEM.values()];
 const BED_BLOCK_NAMES = new Set([...BED_ITEM_NAMES, 'bed']);
-const BED_ASSIGNMENT_ORDER: readonly BotRole[] = ['farm', 'mine', 'trading'] as const;
 
 type BedMetadata = {
   part: boolean;
@@ -106,6 +107,8 @@ export class MineflayerMicroBasePort implements MicroBasePort {
   private readonly maxConsecutivePlankGatherStalls = 6;
   private readonly buildingMaterialRestockPlanks = 12;
   private readonly roofAccessStepZ = 1;
+  private readonly shelterLayout: ShelterLayoutService;
+  private readonly bedAssignmentService = new BedAssignmentService();
 
   constructor(
     private readonly bot: BotWithPathfinder,
@@ -122,7 +125,14 @@ export class MineflayerMicroBasePort implements MicroBasePort {
     private readonly isScenarioActive: () => boolean,
     private readonly waitUntilTaskMayProceed: () => Promise<void>,
     private readonly isThreatResponseActive: () => boolean,
-  ) {}
+  ) {
+    this.shelterLayout = new ShelterLayoutService({
+      width: this.houseWidth,
+      length: this.houseLength,
+      wallHeight: this.wallHeight,
+      roofAccessStepZ: this.roofAccessStepZ,
+    });
+  }
 
   async ensureWoodenSwordNearRallyPoint(rallyPoint: BotRallyPoint): Promise<void> {
     this.ensureScenarioActive();
@@ -442,8 +452,6 @@ export class MineflayerMicroBasePort implements MicroBasePort {
     this.ensureScenarioActive();
     await this.waitForTaskPriority();
     const origin = this.getShelterOrigin(rallyPoint);
-    const doorX = Math.floor(this.houseWidth / 2);
-    const doorZ = this.houseLength - 1;
 
     this.logger.info(
       `Building a primitive shelter near ${rallyPoint.x} ${rallyPoint.y} ${rallyPoint.z}.`,
@@ -455,84 +463,79 @@ export class MineflayerMicroBasePort implements MicroBasePort {
           const isPerimeter =
             x === 0 || x === this.houseWidth - 1 || z === 0 || z === this.houseLength - 1;
 
-            if (!isPerimeter) {
-              continue;
-            }
-
-            const isDoorOpening = x === doorX && z === doorZ && y < 2;
-
-            if (isDoorOpening) {
-              continue;
-            }
-
-            await this.placePlankBlock(origin.offset(x, y, z), rallyPoint);
+          if (!isPerimeter) {
+            continue;
           }
+
+          const isDoorOpening = this.isShelterDoorOpeningPosition(origin.offset(x, y, z), rallyPoint);
+
+          if (isDoorOpening) {
+            continue;
+          }
+
+          await this.placePlankBlock(origin.offset(x, y, z), rallyPoint);
         }
       }
+    }
 
     await this.buildRoofFromAbove(rallyPoint, origin);
 
-    const doorPosition = origin.offset(Math.floor(this.houseWidth / 2), 0, this.houseLength - 1);
-    await this.placeDoor(doorPosition, rallyPoint);
+    await this.placeDoor(this.getShelterDoorPosition(rallyPoint), rallyPoint);
     this.logger.info('Finished building the primitive shelter.');
   }
 
   private async buildRoofFromAbove(rallyPoint: BotRallyPoint, origin: Vec3): Promise<void> {
     await this.ensureRoofAccess(rallyPoint, origin);
     this.logger.info('Climbing above the shelter to finish the roof.');
-    await this.navigateTo(this.getRoofAccessStandingPosition(origin), 1);
+    await this.navigateTo(this.getRoofAccessStandingPosition(rallyPoint), 1);
 
-    for (const position of this.getRoofPositions(origin)) {
+    for (const position of this.getRoofPositions(rallyPoint)) {
       await this.placePlankBlock(position, rallyPoint);
     }
   }
 
   private async ensureRoofAccess(rallyPoint: BotRallyPoint, origin: Vec3): Promise<void> {
-    for (const stepPosition of this.getRoofAccessStepPositions(origin)) {
+    for (const stepPosition of this.getRoofAccessStepPositions(rallyPoint)) {
       await this.placePlankBlock(stepPosition, rallyPoint);
     }
   }
 
-  private getRoofAccessStepPositions(origin: Vec3): Vec3[] {
-    return [
-      origin.offset(this.houseWidth + 2, 0, this.roofAccessStepZ),
-      origin.offset(this.houseWidth + 1, 1, this.roofAccessStepZ),
-      origin.offset(this.houseWidth, 2, this.roofAccessStepZ),
-    ];
+  private getRoofAccessStepPositions(rallyPoint: BotRallyPoint): Vec3[] {
+    return this.shelterLayout
+      .getRoofAccessStepPositions(rallyPoint)
+      .map((position) => this.toBlockVec3(position));
   }
 
-  private getRoofAccessStandingPosition(origin: Vec3): Vec3 {
-    return this.getRoofAccessStepPositions(origin)[2].offset(0, 1, 0);
+  private getRoofAccessStandingPosition(rallyPoint: BotRallyPoint): Vec3 {
+    return this.toBlockVec3(this.shelterLayout.getRoofAccessStandingPosition(rallyPoint));
   }
 
-  private getRoofPositions(origin: Vec3): Vec3[] {
-    const positions: Vec3[] = [];
-    const roofAccessStandingPosition = this.getRoofAccessStandingPosition(origin);
+  private getRoofPositions(rallyPoint: BotRallyPoint): Vec3[] {
+    const roofAccessStandingPosition = this.toBlockVec3(
+      this.shelterLayout.getRoofAccessStandingPosition(rallyPoint),
+    );
 
-    for (let x = 0; x < this.houseWidth; x += 1) {
-      for (let z = 0; z < this.houseLength; z += 1) {
-        positions.push(origin.offset(x, this.wallHeight, z));
-      }
-    }
+    return this.shelterLayout
+      .getRoofPositions(rallyPoint)
+      .map((position) => this.toBlockVec3(position))
+      .sort((left, right) => {
+        const leftDistance = left.distanceSquared(roofAccessStandingPosition);
+        const rightDistance = right.distanceSquared(roofAccessStandingPosition);
 
-    return positions.sort((left, right) => {
-      const leftDistance = left.distanceSquared(roofAccessStandingPosition);
-      const rightDistance = right.distanceSquared(roofAccessStandingPosition);
-
-      return leftDistance - rightDistance;
-    });
+        return leftDistance - rightDistance;
+      });
   }
 
   private async placeThreeBeds(rallyPoint: BotRallyPoint): Promise<void> {
     this.ensureScenarioActive();
     await this.waitForTaskPriority();
-    if (this.countPlacedBedBlocksNearRallyPoint(rallyPoint) >= 6) {
+    if (this.hasAllExpectedBedsPlaced(rallyPoint)) {
       return;
     }
 
-    const origin = this.getShelterOrigin(rallyPoint);
-    const bedRowZ = Math.max(1, this.houseLength - 4);
-    const bedPositions = [origin.offset(2, 0, bedRowZ), origin.offset(4, 0, bedRowZ), origin.offset(6, 0, bedRowZ)];
+    const bedPositions = this.shelterLayout
+      .getBedFootPositions(rallyPoint)
+      .map((position) => this.toBlockVec3(position));
     await this.moveInsideShelter(rallyPoint);
 
     for (const position of bedPositions) {
@@ -871,6 +874,10 @@ export class MineflayerMicroBasePort implements MicroBasePort {
 
       if (!this.isSleepWindow()) {
         for (const bed of beds) {
+          if (this.isBedOccupied(bed)) {
+            continue;
+          }
+
           try {
             await this.navigateTo(bed.position, 2);
             await this.touchBedToSetSpawnPoint(bed);
@@ -1109,13 +1116,9 @@ export class MineflayerMicroBasePort implements MicroBasePort {
       return beds;
     }
 
-    const preferredIndex = this.getBedAssignmentIndex() % beds.length;
-    return beds.map((_, offset) => beds[(preferredIndex + offset) % beds.length]);
-  }
-
-  private getBedAssignmentIndex(): number {
-    const assignedIndex = BED_ASSIGNMENT_ORDER.indexOf(this.botRole);
-    return assignedIndex >= 0 ? assignedIndex : 0;
+    return this.bedAssignmentService
+      .getAssignmentOrder(this.botRole, beds.length)
+      .map((index) => beds[index]!);
   }
 
   private isBedOccupied(bed: Block): boolean {
@@ -1181,58 +1184,86 @@ export class MineflayerMicroBasePort implements MicroBasePort {
   }
 
   private isShelterReadyForSpawn(rallyPoint: BotRallyPoint): boolean {
-    return this.isShelterBuilt(rallyPoint) && this.hasPlacedShelterDoor(rallyPoint) && this.countPlacedBedBlocksNearRallyPoint(rallyPoint) >= 6;
+    return (
+      this.isShelterBuilt(rallyPoint) &&
+      this.hasPlacedShelterDoor(rallyPoint) &&
+      this.isShelterTraversable(rallyPoint) &&
+      this.arePlacedBedsAccessible(rallyPoint)
+    );
   }
 
   private isShelterBuilt(rallyPoint: BotRallyPoint): boolean {
-    const origin = this.getShelterOrigin(rallyPoint);
-    const doorX = Math.floor(this.houseWidth / 2);
-    const doorZ = this.houseLength - 1;
-
-    for (let y = 0; y < this.wallHeight; y += 1) {
-      for (let x = 0; x < this.houseWidth; x += 1) {
-        for (let z = 0; z < this.houseLength; z += 1) {
-          const isPerimeter =
-            x === 0 || x === this.houseWidth - 1 || z === 0 || z === this.houseLength - 1;
-
-          if (!isPerimeter) {
-            continue;
-          }
-
-          const isDoorOpening = x === doorX && z === doorZ && y < 2;
-
-          if (isDoorOpening) {
-            continue;
-          }
-
-          if (!this.hasAllowedBlockAtPosition(origin.offset(x, y, z), new Set(PLANK_ITEM_NAMES))) {
-            return false;
-          }
-        }
-      }
-    }
-
-    for (let x = 0; x < this.houseWidth; x += 1) {
-      for (let z = 0; z < this.houseLength; z += 1) {
-        if (!this.hasAllowedBlockAtPosition(origin.offset(x, this.wallHeight, z), new Set(PLANK_ITEM_NAMES))) {
-          return false;
-        }
-      }
-    }
-
-    return true;
+    return (
+      this.shelterLayout
+        .getWallPositions(rallyPoint)
+        .every((position) =>
+          this.hasAllowedBlockAtPosition(this.toBlockVec3(position), new Set(PLANK_ITEM_NAMES)),
+        ) &&
+      this.shelterLayout
+        .getRoofPositions(rallyPoint)
+        .every((position) =>
+          this.hasAllowedBlockAtPosition(this.toBlockVec3(position), new Set(PLANK_ITEM_NAMES)),
+        )
+    );
   }
 
   private hasPlacedShelterDoor(rallyPoint: BotRallyPoint): boolean {
-    const origin = this.getShelterOrigin(rallyPoint);
-    const doorPosition = origin.offset(Math.floor(this.houseWidth / 2), 0, this.houseLength - 1);
+    const doorPosition = this.getShelterDoorPosition(rallyPoint);
     const lowerDoorBlock = this.bot.blockAt(doorPosition);
     const upperDoorBlock = this.bot.blockAt(doorPosition.offset(0, 1, 0));
 
     return (
-      (!!lowerDoorBlock && DOOR_ITEM_NAMES.includes(lowerDoorBlock.name)) ||
-      (!!upperDoorBlock && DOOR_ITEM_NAMES.includes(upperDoorBlock.name))
+      !!lowerDoorBlock &&
+      !!upperDoorBlock &&
+      DOOR_ITEM_NAMES.includes(lowerDoorBlock.name) &&
+      DOOR_ITEM_NAMES.includes(upperDoorBlock.name)
     );
+  }
+
+  private isShelterTraversable(rallyPoint: BotRallyPoint): boolean {
+    return this.shelterLayout
+      .getDoorwayPassagePositions(rallyPoint)
+      .every((position) => this.isPassableStandPosition(position));
+  }
+
+  private arePlacedBedsAccessible(rallyPoint: BotRallyPoint): boolean {
+    return this.shelterLayout.getBedFootPositions(rallyPoint).every((bedPosition) => {
+      return (
+        this.hasPlacedBedAtPosition(bedPosition, rallyPoint) &&
+        this.shelterLayout
+          .getBedAccessCandidatePositions(rallyPoint, bedPosition)
+          .some((candidate) => this.isPassableStandPosition(candidate))
+      );
+    });
+  }
+
+  private hasAllExpectedBedsPlaced(rallyPoint: BotRallyPoint): boolean {
+    return this.shelterLayout
+      .getBedFootPositions(rallyPoint)
+      .every((position) => this.hasPlacedBedAtPosition(position, rallyPoint));
+  }
+
+  private hasPlacedBedAtPosition(position: BlockPosition, rallyPoint: BotRallyPoint): boolean {
+    const blockKey = this.toBlockKey(this.toBlockVec3(position));
+
+    return this.getUniquePlacedBedsNearRallyPoint(rallyPoint).some((bed) => {
+      return this.toBlockKey(bed.position) === blockKey;
+    });
+  }
+
+  private isPassableStandPosition(position: BlockPosition): boolean {
+    const footBlock = this.bot.blockAt(this.toBlockVec3(position));
+    const headBlock = this.bot.blockAt(this.toBlockVec3(position).offset(0, 1, 0));
+
+    return this.isPassableShelterSpaceBlock(footBlock) && this.isPassableShelterSpaceBlock(headBlock);
+  }
+
+  private isPassableShelterSpaceBlock(block: Block | null): boolean {
+    if (!block) {
+      return false;
+    }
+
+    return this.isAirBlockName(block.name) || DOOR_ITEM_NAMES.includes(block.name);
   }
 
   private countCraftableBeds(): number {
@@ -1327,11 +1358,7 @@ export class MineflayerMicroBasePort implements MicroBasePort {
   }
 
   private getShelterOrigin(rallyPoint: BotRallyPoint): Vec3 {
-    return new Vec3(
-      rallyPoint.x - Math.floor(this.houseWidth / 2),
-      rallyPoint.y,
-      rallyPoint.z - Math.floor(this.houseLength / 2),
-    );
+    return this.toBlockVec3(this.shelterLayout.getOrigin(rallyPoint));
   }
 
   private async moveInsideShelter(rallyPoint: BotRallyPoint): Promise<void> {
@@ -1364,13 +1391,11 @@ export class MineflayerMicroBasePort implements MicroBasePort {
   }
 
   private getShelterInteriorAnchor(rallyPoint: BotRallyPoint): Vec3 {
-    const origin = this.getShelterOrigin(rallyPoint);
-    return origin.offset(Math.floor(this.houseWidth / 2), 0, this.houseLength - 2);
+    return this.toBlockVec3(this.shelterLayout.getInteriorAnchor(rallyPoint));
   }
 
   private getShelterDoorPosition(rallyPoint: BotRallyPoint): Vec3 {
-    const origin = this.getShelterOrigin(rallyPoint);
-    return origin.offset(Math.floor(this.houseWidth / 2), 0, this.houseLength - 1);
+    return this.toBlockVec3(this.shelterLayout.getDoorPosition(rallyPoint));
   }
 
   private isDoorBlock(block: Block): boolean {
@@ -1416,24 +1441,30 @@ export class MineflayerMicroBasePort implements MicroBasePort {
       return false;
     }
 
-    const origin = this.getShelterOrigin(rallyPoint);
-    const position = this.bot.entity.position;
-    const minX = origin.x + 1;
-    const maxX = origin.x + this.houseWidth - 2;
-    const minZ = origin.z + 1;
-    const maxZ = origin.z + this.houseLength - 2;
+    const position = this.bot.entity.position.floored();
 
-    return (
-      position.x >= minX &&
-      position.x <= maxX + 0.999 &&
-      position.z >= minZ &&
-      position.z <= maxZ + 0.999 &&
-      Math.abs(position.y - rallyPoint.y) <= 1.5
+    return this.shelterLayout.isInsideInterior(
+      {
+        x: position.x,
+        y: position.y,
+        z: position.z,
+      },
+      rallyPoint,
     );
+  }
+
+  private isShelterDoorOpeningPosition(position: Vec3, rallyPoint: BotRallyPoint): boolean {
+    const doorPosition = this.getShelterDoorPosition(rallyPoint);
+
+    return position.x === doorPosition.x && position.z === doorPosition.z && position.y < doorPosition.y + 2;
   }
 
   private toVec3(rallyPoint: BotRallyPoint): Vec3 {
     return new Vec3(rallyPoint.x, rallyPoint.y, rallyPoint.z);
+  }
+
+  private toBlockVec3(position: BlockPosition): Vec3 {
+    return new Vec3(position.x, position.y, position.z);
   }
 
   private stringifyError(error: unknown): string {

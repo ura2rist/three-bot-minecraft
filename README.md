@@ -234,3 +234,26 @@ src
 ```
 
 Принцип: `domain` не зависит от инфраструктуры, `application` оркестрирует сценарии, `infrastructure` адаптирует внешние системы, `interfaces` содержит точки входа.
+
+## Tests
+
+Run tests from a WSL terminal inside `/home/ura2rist/mine-bot`:
+
+```bash
+npm run test
+```
+
+Watch mode:
+
+```bash
+npm run test:watch
+```
+
+Useful verification commands:
+
+```bash
+npm run typecheck
+npm run build
+```
+
+Important: do not run these commands from a PowerShell session opened at a `\\wsl$\\...` path. Use a WSL shell, otherwise `npm` may fall back to `cmd.exe` and fail on UNC paths.
