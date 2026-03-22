@@ -1,4 +1,8 @@
 import mineflayer from 'mineflayer';
+import { BotActivityEvent } from '../../application/bot/events/BotActivityEvent';
+import { BotPriorityLifecycleSubscriber } from '../../application/bot/subscribers/BotPriorityLifecycleSubscriber';
+import { BotThreatPrioritySubscriber } from '../../application/bot/subscribers/BotThreatPrioritySubscriber';
+import { BotPriorityCoordinator } from '../../application/bot/services/BotPriorityCoordinator';
 import { BotClient } from '../../application/bot/ports/BotClient';
 import { EstablishMicroBaseService } from '../../application/bot/services/EstablishMicroBaseService';
 import { DeterministicMicroBaseAssignmentPolicy } from '../../application/bot/services/DeterministicMicroBaseAssignmentPolicy';
@@ -14,6 +18,7 @@ import { MineflayerNearbyDroppedItemCollector } from './MineflayerNearbyDroppedI
 import { MineflayerLogHarvestingPort } from './MineflayerLogHarvestingPort';
 import { MineflayerSquadDefenseController } from './MineflayerSquadDefenseController';
 import type { BotWithPathfinder, PathfinderApi, PathfinderMovements } from './MineflayerPortsShared';
+import { InMemoryEventBus } from '../events/InMemoryEventBus';
 
 const mineflayerPathfinder = require('../../../.vendor/mineflayer-pathfinder-master');
 const pathfinderPlugin = mineflayerPathfinder.pathfinder as (bot: mineflayer.Bot) => void;
@@ -185,6 +190,21 @@ export class MineflayerBotClient implements BotClient {
     let configurationFallbackTriggered = false;
     let rallyNavigationPromise: Promise<void> | null = null;
     let rallyNavigationAttempt = 0;
+    const eventBus = new InMemoryEventBus<BotActivityEvent>();
+    const priorityCoordinator = new BotPriorityCoordinator();
+    const eventBusUnsubscribers = [
+      ...new BotPriorityLifecycleSubscriber(eventBus, priorityCoordinator).subscribe(),
+      ...new BotThreatPrioritySubscriber(eventBus, priorityCoordinator).subscribe(),
+    ];
+    const disposeEventBusSubscriptions = () => {
+      while (eventBusUnsubscribers.length > 0) {
+        const unsubscribe = eventBusUnsubscribers.pop();
+        unsubscribe?.();
+      }
+    };
+    const publishEvent = async (event: BotActivityEvent) => {
+      await eventBus.publish(event);
+    };
     const configurePathfinder = () => {
       if (!bot.pathfinder) {
         return;
@@ -251,6 +271,8 @@ export class MineflayerBotClient implements BotClient {
         logger.child('defense'),
         this.friendlyUsernames,
         (target, range) => this.gotoPosition(pathfinderBot, target, range),
+        () => priorityCoordinator.canInterruptWithThreatResponse(),
+        publishEvent,
       );
       return squadDefenseController;
     };
@@ -279,8 +301,13 @@ export class MineflayerBotClient implements BotClient {
           logHarvestingPort,
           getNearbyDroppedItemCollector(),
           () => scenarioGeneration === microBaseScenarioGeneration,
+          () => priorityCoordinator.waitUntilTaskMayProceed(
+            () => scenarioGeneration === microBaseScenarioGeneration,
+          ),
+          () => priorityCoordinator.isThreatResponseActive(),
         ),
         microBaseLogger,
+        eventBus,
       );
 
       void microBaseService.execute(configuration).catch((error) => {
@@ -342,11 +369,25 @@ export class MineflayerBotClient implements BotClient {
 
       rallyNavigationPromise = Promise.resolve()
         .then(async () => {
+          await publishEvent({
+            type: 'bot.rally.started',
+            payload: {
+              username: configuration.username,
+            },
+          });
+
           if (shouldMoveToRallyPoint) {
             await this.moveToRallyPoint(bot, configuration, logger);
           } else {
             logger.info('Proceeding with the post-rally scenario without movement.');
           }
+
+          await publishEvent({
+            type: 'bot.rally.completed',
+            payload: {
+              username: configuration.username,
+            },
+          });
 
           await runPostRallyScenario();
         })
@@ -387,6 +428,17 @@ export class MineflayerBotClient implements BotClient {
       hasSpawned = true;
       logger.info(spawnCount === 1 ? 'Bot spawned in the world.' : 'Bot respawned in the world.');
 
+      if (spawnCount > 1) {
+        void publishEvent({
+          type: 'bot.respawned',
+          payload: {
+            username: configuration.username,
+          },
+        }).catch((error) => {
+          logger.warn(`Failed to publish the respawn event: ${this.stringifyError(error)}.`);
+        });
+      }
+
       if (isAuthenticated) {
         getNearbyDroppedItemCollector().start();
         getSquadDefenseController().start();
@@ -397,6 +449,14 @@ export class MineflayerBotClient implements BotClient {
     bot.on('death', () => {
       nearbyDroppedItemCollector?.stop();
       squadDefenseController?.stop();
+      void publishEvent({
+        type: 'bot.died',
+        payload: {
+          username: configuration.username,
+        },
+      }).catch((error) => {
+        logger.warn(`Failed to publish the death event: ${this.stringifyError(error)}.`);
+      });
       cancelScenarios('bot died');
       logger.warn('Bot died. Rally navigation will restart after respawn.');
       stopRallyNavigation('bot died');
@@ -490,6 +550,13 @@ export class MineflayerBotClient implements BotClient {
     bot.on('end', (reason) => {
       nearbyDroppedItemCollector?.stop();
       squadDefenseController?.stop();
+      void publishEvent({
+        type: 'bot.died',
+        payload: {
+          username: configuration.username,
+        },
+      }).catch(() => undefined);
+      disposeEventBusSubscriptions();
       cancelScenarios('connection ended');
       logger.info(`Bot connection ended: ${reason ?? 'unknown reason'}`);
       scheduleReconnect(`connection ended: ${reason ?? 'unknown reason'}`);
@@ -498,6 +565,13 @@ export class MineflayerBotClient implements BotClient {
     bot.on('kicked', (reason) => {
       nearbyDroppedItemCollector?.stop();
       squadDefenseController?.stop();
+      void publishEvent({
+        type: 'bot.died',
+        payload: {
+          username: configuration.username,
+        },
+      }).catch(() => undefined);
+      disposeEventBusSubscriptions();
       cancelScenarios('bot was kicked');
       logger.error(`Bot was kicked: ${String(reason)}`);
       scheduleReconnect(`bot was kicked: ${this.stringifyError(reason)}`);
@@ -506,6 +580,13 @@ export class MineflayerBotClient implements BotClient {
     bot.on('error', (error) => {
       nearbyDroppedItemCollector?.stop();
       squadDefenseController?.stop();
+      void publishEvent({
+        type: 'bot.died',
+        payload: {
+          username: configuration.username,
+        },
+      }).catch(() => undefined);
+      disposeEventBusSubscriptions();
       cancelScenarios('client error');
       logger.error('Mineflayer client error.', error);
       scheduleReconnect(`client error: ${error.message}`);

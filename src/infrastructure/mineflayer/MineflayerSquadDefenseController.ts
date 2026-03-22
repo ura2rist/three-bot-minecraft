@@ -1,4 +1,5 @@
 import { Entity } from 'prismarine-entity';
+import { BotActivityEvent } from '../../application/bot/events/BotActivityEvent';
 import { Logger } from '../../application/shared/ports/Logger';
 import { BotWithPathfinder } from './MineflayerPortsShared';
 
@@ -11,6 +12,8 @@ export class MineflayerSquadDefenseController {
     private readonly logger: Logger,
     private readonly friendlyUsernames: ReadonlySet<string>,
     private readonly gotoPosition: (target: { x: number; y: number; z: number }, range: number) => Promise<void>,
+    private readonly canInterruptWithThreatResponse: () => boolean,
+    private readonly publishEvent: (event: BotActivityEvent) => Promise<void>,
   ) {}
 
   start(): void {
@@ -100,28 +103,60 @@ export class MineflayerSquadDefenseController {
       `Detected a threat ${source.displayName ?? source.name ?? 'unknown'} near the squad. Engaging.`,
     );
 
-    for (let attempt = 0; attempt < 6; attempt += 1) {
-      if (!this.bot.entity || !source.isValid) {
-        return;
+    const threatName = source.displayName ?? source.name ?? 'unknown';
+    const mayInterruptCurrentTask = this.canInterruptWithThreatResponse();
+
+    if (mayInterruptCurrentTask) {
+      await this.publishEvent({
+        type: 'bot.threat.engaged',
+        payload: {
+          username: this.bot.username,
+          threatName,
+        },
+      });
+    }
+
+    try {
+      for (let attempt = 0; attempt < 6; attempt += 1) {
+        if (!this.bot.entity || !source.isValid) {
+          return;
+        }
+
+        const distance = this.bot.entity.position.distanceTo(source.position);
+
+        if (distance > 12) {
+          return;
+        }
+
+        if (distance > 3) {
+          if (!mayInterruptCurrentTask) {
+            this.logger.info(
+              `Holding the current route because threat response is lower priority until the rally point is reached.`,
+            );
+            return;
+          }
+
+          await this.gotoPosition(source.position, 2).catch(() => undefined);
+        }
+
+        if (!source.isValid) {
+          return;
+        }
+
+        await this.bot.lookAt(source.position.offset(0, Math.max(source.height / 2, 0.5), 0), true);
+        this.bot.attack(source);
+        await this.bot.waitForTicks(10);
       }
-
-      const distance = this.bot.entity.position.distanceTo(source.position);
-
-      if (distance > 12) {
-        return;
+    } finally {
+      if (mayInterruptCurrentTask) {
+        await this.publishEvent({
+          type: 'bot.threat.resolved',
+          payload: {
+            username: this.bot.username,
+            threatName,
+          },
+        });
       }
-
-      if (distance > 3) {
-        await this.gotoPosition(source.position, 2).catch(() => undefined);
-      }
-
-      if (!source.isValid) {
-        return;
-      }
-
-      await this.bot.lookAt(source.position.offset(0, Math.max(source.height / 2, 0.5), 0), true);
-      this.bot.attack(source);
-      await this.bot.waitForTicks(10);
     }
   }
 }

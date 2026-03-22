@@ -84,6 +84,8 @@ export class MineflayerMicroBasePort implements MicroBasePort {
     private readonly logHarvestingPort: MineflayerLogHarvestingPort,
     private readonly nearbyDroppedItemCollector: MineflayerNearbyDroppedItemCollector,
     private readonly isScenarioActive: () => boolean,
+    private readonly waitUntilTaskMayProceed: () => Promise<void>,
+    private readonly isThreatResponseActive: () => boolean,
   ) {}
 
   async ensureWoodenSwordNearRallyPoint(rallyPoint: BotRallyPoint): Promise<void> {
@@ -115,6 +117,7 @@ export class MineflayerMicroBasePort implements MicroBasePort {
 
   async establishAtRallyPoint(rallyPoint: BotRallyPoint): Promise<void> {
     this.ensureScenarioActive();
+    await this.waitForTaskPriority();
     await this.waitForNearbyCraftingTable(rallyPoint);
     await this.ensureBedsCraftable(rallyPoint, 3);
     await this.ensurePlanksAvailable(this.woodTargetPlanks);
@@ -135,6 +138,7 @@ export class MineflayerMicroBasePort implements MicroBasePort {
     this.ensureScenarioActive();
     while (!this.bot.isSleeping) {
       this.ensureScenarioActive();
+      await this.waitForTaskPriority();
       if (this.countPlacedBedBlocksNearRallyPoint(rallyPoint) >= 6) {
         await this.sleepUntilSpawnIsSet(rallyPoint);
         return;
@@ -155,6 +159,7 @@ export class MineflayerMicroBasePort implements MicroBasePort {
   private async ensureBedsCraftable(rallyPoint: BotRallyPoint, targetBeds: number): Promise<void> {
     while (this.countInventoryBeds() + this.countCraftableBeds() < targetBeds) {
       this.ensureScenarioActive();
+      await this.waitForTaskPriority();
       const sheep = await this.findNearestSheepOrSearchAroundRallyPoint(rallyPoint);
 
       if (!sheep) {
@@ -177,6 +182,7 @@ export class MineflayerMicroBasePort implements MicroBasePort {
 
     for (let attempt = 0; this.countTotalPlanks() < minPlanks; attempt += 1) {
       this.ensureScenarioActive();
+      await this.waitForTaskPriority();
       if (attempt >= 24) {
         throw this.createMissingThingError(`достаточно брёвен для ${minPlanks} досок`);
       }
@@ -192,6 +198,7 @@ export class MineflayerMicroBasePort implements MicroBasePort {
 
     while (true) {
       this.ensureScenarioActive();
+      await this.waitForTaskPriority();
       let craftedDuringPass = false;
 
       for (const [logItemName, plankItemName] of LOG_TO_PLANK_ITEM.entries()) {
@@ -259,6 +266,7 @@ export class MineflayerMicroBasePort implements MicroBasePort {
   private async huntSheep(sheep: Entity): Promise<void> {
     for (let attempt = 0; attempt < 10; attempt += 1) {
       this.ensureScenarioActive();
+      await this.waitForTaskPriority();
       if (!sheep.isValid) {
         return;
       }
@@ -309,6 +317,7 @@ export class MineflayerMicroBasePort implements MicroBasePort {
 
   private async buildShelter(rallyPoint: BotRallyPoint): Promise<void> {
     this.ensureScenarioActive();
+    await this.waitForTaskPriority();
     const origin = new Vec3(rallyPoint.x - 2, rallyPoint.y, rallyPoint.z - 2);
 
     this.logger.info(
@@ -349,6 +358,7 @@ export class MineflayerMicroBasePort implements MicroBasePort {
 
   private async placeThreeBeds(rallyPoint: BotRallyPoint): Promise<void> {
     this.ensureScenarioActive();
+    await this.waitForTaskPriority();
     if (this.countPlacedBedBlocksNearRallyPoint(rallyPoint) >= 6) {
       return;
     }
@@ -411,6 +421,7 @@ export class MineflayerMicroBasePort implements MicroBasePort {
     yaw?: number,
   ): Promise<void> {
     this.ensureScenarioActive();
+    await this.waitForTaskPriority();
     const currentBlock = this.bot.blockAt(position);
 
     if (currentBlock && allowedExistingBlockNames.has(currentBlock.name)) {
@@ -479,6 +490,7 @@ export class MineflayerMicroBasePort implements MicroBasePort {
   private async sleepUntilSpawnIsSet(rallyPoint: BotRallyPoint): Promise<void> {
     while (!this.bot.isSleeping) {
       this.ensureScenarioActive();
+      await this.waitForTaskPriority();
       const beds = this.findPlacedBedsNearRallyPoint(rallyPoint);
 
       if (beds.length === 0) {
@@ -522,6 +534,7 @@ export class MineflayerMicroBasePort implements MicroBasePort {
 
   private async findNearestSheepOrSearchAroundRallyPoint(rallyPoint: BotRallyPoint): Promise<Entity | null> {
     this.ensureScenarioActive();
+    await this.waitForTaskPriority();
     const nearbySheep = this.findNearestSheep();
 
     if (nearbySheep) {
@@ -721,6 +734,7 @@ export class MineflayerMicroBasePort implements MicroBasePort {
     rallyPoint?: BotRallyPoint,
   ): Promise<boolean> {
     this.ensureScenarioActive();
+    await this.waitForTaskPriority();
     const itemId = this.bot.registry.itemsByName[itemName]?.id;
 
     if (itemId === undefined) {
@@ -771,18 +785,45 @@ export class MineflayerMicroBasePort implements MicroBasePort {
   }
 
   private async navigateTo(target: Vec3, range: number): Promise<void> {
-    this.ensureScenarioActive();
+    while (true) {
+      this.ensureScenarioActive();
+      await this.waitForTaskPriority();
 
-    try {
-      await this.gotoPosition(target, range);
-    } catch (error) {
-      if (!this.isScenarioActive()) {
-        throw new MicroBaseScenarioCancelledError();
+      try {
+        await this.gotoPosition(target, range);
+        this.ensureScenarioActive();
+        return;
+      } catch (error) {
+        if (!this.isScenarioActive()) {
+          throw new MicroBaseScenarioCancelledError();
+        }
+
+        if (this.isThreatResponseActive() && this.isRetryablePriorityInterruption(error)) {
+          this.logger.info(
+            `Pausing the current task because combat has higher priority: ${this.stringifyError(error)}.`,
+          );
+          await this.waitForTaskPriority();
+          continue;
+        }
+
+        throw error;
       }
-
-      throw error;
     }
+  }
 
+  private async waitForTaskPriority(): Promise<void> {
     this.ensureScenarioActive();
+    await this.waitUntilTaskMayProceed();
+    this.ensureScenarioActive();
+  }
+
+  private isRetryablePriorityInterruption(error: unknown): boolean {
+    const message = this.stringifyError(error).toLowerCase();
+
+    return (
+      message.includes('goal changed') ||
+      message.includes('path was stopped') ||
+      message.includes('path stopped before it could be completed')
+    );
   }
 }
