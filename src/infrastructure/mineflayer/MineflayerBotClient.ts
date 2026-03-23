@@ -203,6 +203,7 @@ export class MineflayerBotClient implements BotClient {
     let reconnectScheduled = false;
     let microBaseScenarioStarted = false;
     let microBaseScenarioGeneration = 0;
+    let nightlyShelterRoutineStarted = false;
     let spawnCount = 0;
     let configurationSettingsSent = false;
     let configurationFallbackTriggered = false;
@@ -255,6 +256,7 @@ export class MineflayerBotClient implements BotClient {
     const cancelScenarios = (reason: string) => {
       microBaseScenarioGeneration += 1;
       microBaseScenarioStarted = false;
+      nightlyShelterRoutineStarted = false;
       bot.pathfinder?.stop();
       logger.info(`Stopped active scenarios: ${reason}.`);
     };
@@ -317,6 +319,96 @@ export class MineflayerBotClient implements BotClient {
       combatService = new MineflayerCombatService(this.requirePathfinderBot(bot));
       return combatService;
     };
+    const createScenarioWaiter = (scenarioGeneration: number) => {
+      return () =>
+        priorityCoordinator.waitUntilTaskMayProceed(
+          () => scenarioGeneration === microBaseScenarioGeneration,
+        );
+    };
+    const createMicroBasePort = (scenarioGeneration: number, portLogger: Logger) => {
+      const pathfinderBot = this.requirePathfinderBot(bot);
+      const publishNightShelterStarted = async () => {
+        if (scenarioGeneration !== microBaseScenarioGeneration) {
+          return;
+        }
+
+        await publishEvent({
+          type: 'bot.task.started',
+          payload: {
+            username: configuration.username,
+            task: 'night_shelter',
+          },
+        });
+      };
+      const publishNightShelterCompleted = async () => {
+        if (scenarioGeneration !== microBaseScenarioGeneration) {
+          return;
+        }
+
+        await publishEvent({
+          type: 'bot.task.completed',
+          payload: {
+            username: configuration.username,
+            task: 'night_shelter',
+          },
+        });
+      };
+
+      return new MineflayerMicroBasePort(
+        pathfinderBot,
+        configuration.role,
+        portLogger,
+        (target, range) => this.gotoPosition(pathfinderBot, target, range),
+        new MineflayerLogHarvestingPort(
+          pathfinderBot,
+          portLogger,
+          (target, range) => this.gotoPosition(pathfinderBot, target, range),
+          getNearbyDroppedItemCollector(),
+          createScenarioWaiter(scenarioGeneration),
+          () => priorityCoordinator.isThreatResponseActive(),
+        ),
+        getNearbyDroppedItemCollector(),
+        getCombatService(),
+        (position, minimumDistance) =>
+          this.requestFriendlyBotsToClearPosition(
+            configuration.username,
+            position,
+            minimumDistance,
+            portLogger,
+          ),
+        () => scenarioGeneration === microBaseScenarioGeneration,
+        createScenarioWaiter(scenarioGeneration),
+        () => priorityCoordinator.isThreatResponseActive(),
+        this.friendlyUsernames.size,
+        publishNightShelterStarted,
+        publishNightShelterCompleted,
+      );
+    };
+    const startNightlyShelterRoutine = (scenarioGeneration: number, microBaseLogger: Logger) => {
+      if (!configuration.rallyPoint || nightlyShelterRoutineStarted) {
+        return;
+      }
+
+      nightlyShelterRoutineStarted = true;
+      const microBasePort = createMicroBasePort(scenarioGeneration, microBaseLogger);
+
+      void microBasePort
+        .maintainNightlyShelterRoutine(configuration.rallyPoint)
+        .catch((error) => {
+          if (error instanceof MicroBaseScenarioCancelledError) {
+            return;
+          }
+
+          microBaseLogger.warn(
+            `Night shelter routine stopped unexpectedly: ${this.stringifyError(error)}.`,
+          );
+        })
+        .finally(() => {
+          if (scenarioGeneration === microBaseScenarioGeneration) {
+            nightlyShelterRoutineStarted = false;
+          }
+        });
+    };
     const startMicroBaseScenario = () => {
       if (!configuration.rallyPoint || microBaseScenarioStarted) {
         return;
@@ -324,42 +416,10 @@ export class MineflayerBotClient implements BotClient {
 
       microBaseScenarioStarted = true;
       const scenarioGeneration = microBaseScenarioGeneration;
-
-      const pathfinderBot = this.requirePathfinderBot(bot);
       const microBaseLogger = logger.child('microbase');
-      const logHarvestingPort = new MineflayerLogHarvestingPort(
-        pathfinderBot,
-        microBaseLogger,
-        (target, range) => this.gotoPosition(pathfinderBot, target, range),
-        getNearbyDroppedItemCollector(),
-        () => priorityCoordinator.waitUntilTaskMayProceed(
-          () => scenarioGeneration === microBaseScenarioGeneration,
-        ),
-        () => priorityCoordinator.isThreatResponseActive(),
-      );
       const microBaseService = new EstablishMicroBaseService(
         this.microBaseAssignmentPolicy,
-        new MineflayerMicroBasePort(
-          pathfinderBot,
-          configuration.role,
-          microBaseLogger,
-          (target, range) => this.gotoPosition(pathfinderBot, target, range),
-          logHarvestingPort,
-          getNearbyDroppedItemCollector(),
-          getCombatService(),
-          (position, minimumDistance) =>
-            this.requestFriendlyBotsToClearPosition(
-              configuration.username,
-              position,
-              minimumDistance,
-              microBaseLogger,
-            ),
-          () => scenarioGeneration === microBaseScenarioGeneration,
-          () => priorityCoordinator.waitUntilTaskMayProceed(
-            () => scenarioGeneration === microBaseScenarioGeneration,
-          ),
-          () => priorityCoordinator.isThreatResponseActive(),
-        ),
+        createMicroBasePort(scenarioGeneration, microBaseLogger),
         microBaseLogger,
         eventBus,
         this.squadWeaponReadinessTracker,
@@ -367,24 +427,9 @@ export class MineflayerBotClient implements BotClient {
         () => scenarioGeneration === microBaseScenarioGeneration,
       );
 
-      void microBaseService.execute(configuration).catch(async (error) => {
-        if (error instanceof MicroBaseScenarioCancelledError) {
-          microBaseLogger.info('Micro-base scenario was cancelled and will restart from the beginning if needed.');
-          return;
-        }
-
-        if (
-          scenarioGeneration === microBaseScenarioGeneration &&
-          this.isRetryableRallyNavigationError(error)
-        ) {
-          microBaseLogger.warn(
-            `Micro-base scenario was interrupted before the current step completed. Restarting from the beginning in ${this.rallyRetryDelayMs}ms: ${this.stringifyError(error)}.`,
-          );
-          microBaseScenarioStarted = false;
-          await priorityCoordinator.waitUntilTaskMayProceed(
-            () => scenarioGeneration === microBaseScenarioGeneration,
-          );
-
+      void microBaseService
+        .execute(configuration)
+        .then(() => {
           if (
             scenarioGeneration !== microBaseScenarioGeneration ||
             !isAuthenticated ||
@@ -393,27 +438,56 @@ export class MineflayerBotClient implements BotClient {
             return;
           }
 
-          await this.delay(this.rallyRetryDelayMs);
-
-          if (
-            scenarioGeneration !== microBaseScenarioGeneration ||
-            !isAuthenticated ||
-            !bot.entity
-          ) {
+          startNightlyShelterRoutine(scenarioGeneration, microBaseLogger);
+        })
+        .catch(async (error) => {
+          if (error instanceof MicroBaseScenarioCancelledError) {
+            microBaseLogger.info('Micro-base scenario was cancelled and will restart from the beginning if needed.');
             return;
           }
 
-          startMicroBaseScenario();
-          return;
-        }
+          if (
+            scenarioGeneration === microBaseScenarioGeneration &&
+            this.isRetryableRallyNavigationError(error)
+          ) {
+            microBaseLogger.warn(
+              `Micro-base scenario was interrupted before the current step completed. Restarting from the beginning in ${this.rallyRetryDelayMs}ms: ${this.stringifyError(error)}.`,
+            );
+            microBaseScenarioStarted = false;
+            nightlyShelterRoutineStarted = false;
+            await priorityCoordinator.waitUntilTaskMayProceed(
+              () => scenarioGeneration === microBaseScenarioGeneration,
+            );
 
-        if (this.isFriendlyMissingResourceError(error)) {
-          microBaseLogger.warn(this.stringifyError(error));
-          return;
-        }
+            if (
+              scenarioGeneration !== microBaseScenarioGeneration ||
+              !isAuthenticated ||
+              !bot.entity
+            ) {
+              return;
+            }
 
-        microBaseLogger.error('Failed to establish the micro-base scenario.', error);
-      });
+            await this.delay(this.rallyRetryDelayMs);
+
+            if (
+              scenarioGeneration !== microBaseScenarioGeneration ||
+              !isAuthenticated ||
+              !bot.entity
+            ) {
+              return;
+            }
+
+            startMicroBaseScenario();
+            return;
+          }
+
+          if (this.isFriendlyMissingResourceError(error)) {
+            microBaseLogger.warn(this.stringifyError(error));
+            return;
+          }
+
+          microBaseLogger.error('Failed to establish the micro-base scenario.', error);
+        });
     };
     const runPostRallyScenario = async (isCurrentAttempt: () => boolean) => {
       this.assertCurrentRallyNavigationAttempt(isCurrentAttempt);

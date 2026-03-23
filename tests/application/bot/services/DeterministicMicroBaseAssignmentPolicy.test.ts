@@ -35,3 +35,10 @@ test('DeterministicMicroBaseAssignmentPolicy prefers farm when available', () =>
 
   assert.equal(policy.getLeaderUsername(), 'Gamgee');
 });
+
+test('DeterministicMicroBaseAssignmentPolicy has no leader when the fleet is empty', () => {
+  const policy = new DeterministicMicroBaseAssignmentPolicy();
+  policy.prepareFleet([]);
+
+  assert.equal(policy.getLeaderUsername(), null);
+});

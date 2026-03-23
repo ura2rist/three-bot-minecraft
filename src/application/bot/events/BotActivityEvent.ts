@@ -1,6 +1,11 @@
 import { ApplicationEvent } from '../../shared/events/EventBus';
 
-export type BotTaskName = 'rally' | 'escort' | 'resource_gathering' | 'microbase_setup';
+export type BotTaskName =
+  | 'rally'
+  | 'escort'
+  | 'resource_gathering'
+  | 'microbase_setup'
+  | 'night_shelter';
 
 export type BotActivityEvent =
   | ApplicationEvent<'bot.rally.started', { username: string }>

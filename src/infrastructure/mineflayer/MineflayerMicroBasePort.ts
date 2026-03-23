@@ -7,6 +7,8 @@ import { Logger } from '../../application/shared/ports/Logger';
 import { BotRallyPoint } from '../../domain/bot/entities/BotConfiguration';
 import { BotRole } from '../../domain/bot/entities/BotRole';
 import { BedAssignmentService } from '../../application/bot/services/BedAssignmentService';
+import { NightlyShelterSleepDecisionService } from '../../application/bot/services/NightlyShelterSleepDecisionService';
+import { NightlyShelterTimingService } from '../../application/bot/services/NightlyShelterTimingService';
 import { MineflayerLogHarvestingPort } from './MineflayerLogHarvestingPort';
 import { MineflayerNearbyDroppedItemCollector } from './MineflayerNearbyDroppedItemCollector';
 import { MineflayerCombatService } from './MineflayerCombatService';
@@ -107,8 +109,13 @@ export class MineflayerMicroBasePort implements MicroBasePort {
   private readonly maxConsecutivePlankGatherStalls = 6;
   private readonly buildingMaterialRestockPlanks = 12;
   private readonly roofAccessStepZ = 1;
+  private readonly nightShelterCheckIntervalTicks = 20;
+  private readonly shelterDoorSearchRadius = 8;
   private readonly shelterLayout: ShelterLayoutService;
   private readonly bedAssignmentService = new BedAssignmentService();
+  private readonly nightlyShelterSleepDecisionService = new NightlyShelterSleepDecisionService();
+  private readonly nightlyShelterTimingService = new NightlyShelterTimingService();
+  private readonly minimumShelterBedCount: number;
 
   constructor(
     private readonly bot: BotWithPathfinder,
@@ -125,6 +132,9 @@ export class MineflayerMicroBasePort implements MicroBasePort {
     private readonly isScenarioActive: () => boolean,
     private readonly waitUntilTaskMayProceed: () => Promise<void>,
     private readonly isThreatResponseActive: () => boolean,
+    squadSize: number,
+    private readonly onNightShelterStarted: () => Promise<void> | void = () => undefined,
+    private readonly onNightShelterCompleted: () => Promise<void> | void = () => undefined,
   ) {
     this.shelterLayout = new ShelterLayoutService({
       width: this.houseWidth,
@@ -132,6 +142,7 @@ export class MineflayerMicroBasePort implements MicroBasePort {
       wallHeight: this.wallHeight,
       roofAccessStepZ: this.roofAccessStepZ,
     });
+    this.minimumShelterBedCount = Math.max(3, squadSize);
   }
 
   async ensureWoodenSwordNearRallyPoint(rallyPoint: BotRallyPoint): Promise<void> {
@@ -192,8 +203,10 @@ export class MineflayerMicroBasePort implements MicroBasePort {
       return;
     }
 
-    await this.ensureBedsCraftable(rallyPoint, 3);
-    this.logger.info('Collected enough wool for three beds. Returning to the rally point for the building phase.');
+    await this.ensureBedsCraftable(rallyPoint, this.minimumShelterBedCount);
+    this.logger.info(
+      `Collected enough wool for ${this.minimumShelterBedCount} beds. Returning to the rally point for the building phase.`,
+    );
     await this.navigateTo(this.toVec3(rallyPoint), 2);
     await this.waitForNearbyCraftingTable(rallyPoint);
 
@@ -206,11 +219,11 @@ export class MineflayerMicroBasePort implements MicroBasePort {
       this.logger.info('Shelter structure already exists near the rally point. Skipping the bulk wood-gathering phase.');
     }
 
-    const placedBedCount = this.countPlacedBedsNearRallyPoint(rallyPoint);
-    const missingBeds = Math.max(0, 3 - placedBedCount);
+    const accessibleBedCount = this.countAccessiblePlacedBeds(rallyPoint);
+    const missingBeds = Math.max(0, this.minimumShelterBedCount - accessibleBedCount);
 
     if (missingBeds > 0) {
-      const craftedBeds = await this.craftBeds(rallyPoint, missingBeds);
+      const craftedBeds = await this.craftAdditionalBeds(rallyPoint, missingBeds);
 
       if (craftedBeds < missingBeds) {
         throw this.createMissingThingError('кровати для дома');
@@ -218,7 +231,7 @@ export class MineflayerMicroBasePort implements MicroBasePort {
 
       this.logger.info(`Crafted ${craftedBeds} bed item(s). Proceeding to the shelter construction phase.`);
     } else {
-      this.logger.info('Three beds are already placed near the rally point. Skipping bed crafting.');
+      this.logger.info('Enough beds are already placed near the rally point. Skipping bed crafting.');
     }
 
     if (!this.hasPlacedShelterDoor(rallyPoint)) {
@@ -228,7 +241,7 @@ export class MineflayerMicroBasePort implements MicroBasePort {
     }
 
     await this.buildShelter(rallyPoint);
-    await this.placeThreeBeds(rallyPoint);
+    await this.placeBedsUntilShelterCapacity(rallyPoint);
     await this.sleepUntilSpawnIsSet(rallyPoint);
   }
 
@@ -237,7 +250,7 @@ export class MineflayerMicroBasePort implements MicroBasePort {
     while (!this.bot.isSleeping) {
       this.ensureScenarioActive();
       await this.waitForTaskPriority();
-      if (this.countPlacedBedBlocksNearRallyPoint(rallyPoint) >= 6) {
+      if (this.countAccessiblePlacedBeds(rallyPoint) >= this.minimumShelterBedCount) {
         await this.sleepUntilSpawnIsSet(rallyPoint);
         return;
       }
@@ -251,6 +264,46 @@ export class MineflayerMicroBasePort implements MicroBasePort {
       }
 
       await this.bot.waitForTicks(20);
+    }
+  }
+
+  async maintainNightlyShelterRoutine(rallyPoint: BotRallyPoint): Promise<void> {
+    while (this.isScenarioActive()) {
+      let sleptDuringTheNight = false;
+      let nightShelterTaskStarted = false;
+
+      try {
+        await this.waitUntilNightShelterReturnWindow();
+        this.ensureScenarioActive();
+        await this.onNightShelterStarted();
+        nightShelterTaskStarted = true;
+        this.logger.info(
+          `Night return window opened at timeOfDay ${this.bot.time.timeOfDay ?? 'unknown'}. Returning to the shelter and preparing to sleep.`,
+        );
+        await this.moveInsideShelter(rallyPoint, true);
+        sleptDuringTheNight = await this.sleepInShelterForTheNight(rallyPoint);
+
+        if (sleptDuringTheNight) {
+          await this.waitUntilMorningAfterSleeping();
+        }
+      } catch (error) {
+        if (error instanceof MicroBaseScenarioCancelledError) {
+          return;
+        }
+
+        this.logger.warn(
+          `Night shelter routine was interrupted and will retry shortly: ${this.stringifyError(error)}.`,
+        );
+        await this.bot.waitForTicks(40);
+      } finally {
+        if (nightShelterTaskStarted) {
+          await this.onNightShelterCompleted();
+        }
+      }
+
+      if (nightShelterTaskStarted && !sleptDuringTheNight && this.isScenarioActive()) {
+        await this.expandShelterSleepingCapacityAfterMissedNight(rallyPoint);
+      }
     }
   }
 
@@ -397,6 +450,21 @@ export class MineflayerMicroBasePort implements MicroBasePort {
     return this.countInventoryBeds();
   }
 
+  private async craftAdditionalBeds(
+    rallyPoint: BotRallyPoint,
+    additionalBeds: number,
+  ): Promise<number> {
+    if (additionalBeds <= 0) {
+      return 0;
+    }
+
+    const inventoryBedsBeforeCrafting = this.countInventoryBeds();
+    const targetInventoryBeds = inventoryBedsBeforeCrafting + additionalBeds;
+    const inventoryBedsAfterCrafting = await this.craftBeds(rallyPoint, targetInventoryBeds);
+
+    return Math.max(0, inventoryBedsAfterCrafting - inventoryBedsBeforeCrafting);
+  }
+
   private async huntSheep(sheep: Entity): Promise<void> {
     for (let attempt = 0; attempt < 10; attempt += 1) {
       this.ensureScenarioActive();
@@ -526,24 +594,27 @@ export class MineflayerMicroBasePort implements MicroBasePort {
       });
   }
 
-  private async placeThreeBeds(rallyPoint: BotRallyPoint): Promise<void> {
+  private async placeBedsUntilShelterCapacity(rallyPoint: BotRallyPoint): Promise<void> {
     this.ensureScenarioActive();
     await this.waitForTaskPriority();
-    if (this.hasAllExpectedBedsPlaced(rallyPoint)) {
+    if (this.countAccessiblePlacedBeds(rallyPoint) >= this.minimumShelterBedCount) {
       return;
     }
 
-    const bedPositions = this.shelterLayout
-      .getBedFootPositions(rallyPoint)
-      .map((position) => this.toBlockVec3(position));
     await this.moveInsideShelter(rallyPoint);
 
-    for (const position of bedPositions) {
+    while (this.countAccessiblePlacedBeds(rallyPoint) < this.minimumShelterBedCount) {
+      const position = this.findNextAvailableBedPlacementPosition(rallyPoint);
+
+      if (!position) {
+        throw this.createMissingThingError('РјРµСЃС‚Рѕ РґР»СЏ РєСЂРѕРІР°С‚Рё РІРЅСѓС‚СЂРё РґРѕРјР°');
+      }
+
       await this.moveInsideShelter(rallyPoint);
       await this.placeBed(position, rallyPoint);
     }
 
-    this.logger.info('Placed three beds inside the shelter.');
+    this.logger.info(`Placed ${this.countPlacedBedsNearRallyPoint(rallyPoint)} beds inside the shelter.`);
   }
 
   private async placeBed(position: Vec3, rallyPoint: BotRallyPoint): Promise<void> {
@@ -555,7 +626,7 @@ export class MineflayerMicroBasePort implements MicroBasePort {
           continue;
         }
 
-        for (const yaw of [0, Math.PI]) {
+        for (const yaw of [0, Math.PI / 2, Math.PI, -Math.PI / 2]) {
           try {
             await this.placeBlockFromInventory(
               position,
@@ -582,6 +653,68 @@ export class MineflayerMicroBasePort implements MicroBasePort {
     }
 
     throw this.createMissingThingError(`место для кровати в точке ${position.x} ${position.y} ${position.z}`);
+  }
+
+  private findNextAvailableBedPlacementPosition(rallyPoint: BotRallyPoint): Vec3 | null {
+    const doorPosition = this.getShelterDoorPosition(rallyPoint);
+    const occupiedBedPositions = new Set(
+      this.getUniquePlacedBedsNearRallyPoint(rallyPoint).map((bed) => this.toBlockKey(bed.position)),
+    );
+    const candidatePositions = this.shelterLayout
+      .getInteriorFloorPositions(rallyPoint)
+      .map((position) => this.toBlockVec3(position))
+      .filter((position) => !occupiedBedPositions.has(this.toBlockKey(position)))
+      .sort((left, right) => {
+        const leftDistance = left.distanceSquared(doorPosition);
+        const rightDistance = right.distanceSquared(doorPosition);
+
+        if (leftDistance !== rightDistance) {
+          return rightDistance - leftDistance;
+        }
+
+        if (left.z !== right.z) {
+          return left.z - right.z;
+        }
+
+        return left.x - right.x;
+      });
+
+    return candidatePositions.find((position) => this.isCandidateBedPlacementPosition(position, rallyPoint)) ?? null;
+  }
+
+  private isCandidateBedPlacementPosition(position: Vec3, rallyPoint: BotRallyPoint): boolean {
+    if (!this.isPassableShelterSpaceBlock(this.bot.blockAt(position))) {
+      return false;
+    }
+
+    if (!this.isPassableShelterSpaceBlock(this.bot.blockAt(position.offset(0, 1, 0)))) {
+      return false;
+    }
+
+    const footFloorBlock = this.bot.blockAt(position.offset(0, -1, 0));
+
+    if (!footFloorBlock || footFloorBlock.boundingBox !== 'block') {
+      return false;
+    }
+
+    return this.getCardinalOffsets().some((offset) => {
+      const headPosition = position.plus(offset);
+
+      if (!this.isInsideShelterArea(headPosition, rallyPoint)) {
+        return false;
+      }
+
+      const headFloorBlock = this.bot.blockAt(headPosition.offset(0, -1, 0));
+
+      if (!headFloorBlock || headFloorBlock.boundingBox !== 'block') {
+        return false;
+      }
+
+      return (
+        this.isPassableShelterSpaceBlock(this.bot.blockAt(headPosition)) &&
+        this.isPassableShelterSpaceBlock(this.bot.blockAt(headPosition.offset(0, 1, 0)))
+      );
+    });
   }
 
   private async placeDoor(position: Vec3, rallyPoint: BotRallyPoint): Promise<void> {
@@ -875,6 +1008,9 @@ export class MineflayerMicroBasePort implements MicroBasePort {
       if (!this.isSleepWindow()) {
         for (const bed of beds) {
           if (this.isBedOccupied(bed)) {
+            this.logger.info(
+              `Bed at ${bed.position.x} ${bed.position.y} ${bed.position.z} is occupied. Trying the next bed.`,
+            );
             continue;
           }
 
@@ -896,6 +1032,9 @@ export class MineflayerMicroBasePort implements MicroBasePort {
 
       for (const bed of beds) {
         if (this.isBedOccupied(bed)) {
+          this.logger.info(
+            `Bed at ${bed.position.x} ${bed.position.y} ${bed.position.z} is occupied. Trying the next bed.`,
+          );
           continue;
         }
 
@@ -913,6 +1052,130 @@ export class MineflayerMicroBasePort implements MicroBasePort {
 
       await this.bot.waitForTicks(40);
     }
+  }
+
+  private async sleepInShelterForTheNight(rallyPoint: BotRallyPoint): Promise<boolean> {
+    let sleepWindowObserved = false;
+
+    while (!this.bot.isSleeping) {
+      this.ensureScenarioActive();
+      await this.waitForTaskPriority();
+      await this.moveInsideShelter(rallyPoint, true);
+      const beds = this.getBedSelectionOrder(rallyPoint);
+      const freeBeds = beds.filter((bed) => !this.isBedOccupied(bed));
+      const decision = this.nightlyShelterSleepDecisionService.evaluate({
+        sleepWindowObserved,
+        isSleepWindow: this.isSleepWindow(),
+        isDay: this.bot.time.isDay,
+        totalBeds: beds.length,
+        freeBeds: freeBeds.length,
+      });
+      sleepWindowObserved = decision.nextSleepWindowObserved;
+
+      if (decision.kind === 'expand_after_morning') {
+        this.logger.info(
+          'No free shelter bed was available during the night. Morning has started, so the bot will expand the sleeping capacity.',
+        );
+        return false;
+        throw this.createMissingThingError('кровать рядом с точкой сбора');
+      }
+
+      if (decision.kind === 'wait') {
+        if (decision.reason === 'all_beds_occupied') {
+          this.logger.info('All shelter beds are occupied right now. Waiting for morning before adding more beds.');
+        } else if (decision.reason === 'no_beds_available') {
+          this.logger.info('No shelter beds are available right now. Waiting for morning before adding more beds.');
+        }
+
+        await this.bot.waitForTicks(this.nightShelterCheckIntervalTicks);
+        continue;
+      }
+
+      for (const bed of freeBeds) {
+        try {
+          await this.navigateTo(bed.position, 2);
+          await this.bot.sleep(bed);
+          this.logger.info(
+            `Sleeping in a shelter bed at ${bed.position.x} ${bed.position.y} ${bed.position.z} for the night.`,
+          );
+          return true;
+        } catch (error) {
+          this.logger.warn(`Could not sleep in a shelter bed yet: ${this.stringifyError(error)}.`);
+        }
+      }
+
+      await this.bot.waitForTicks(this.nightShelterCheckIntervalTicks);
+    }
+
+    return true;
+  }
+
+  private async waitUntilMorningAfterSleeping(): Promise<void> {
+    while (this.isScenarioActive()) {
+      if (!this.bot.isSleeping && this.bot.time.isDay) {
+        return;
+      }
+
+      await this.bot.waitForTicks(this.nightShelterCheckIntervalTicks);
+    }
+  }
+
+  private async waitUntilNightShelterReturnWindow(): Promise<void> {
+    while (this.isScenarioActive()) {
+      this.ensureScenarioActive();
+
+      if (this.nightlyShelterTimingService.shouldReturnToShelter(this.bot.time.timeOfDay)) {
+        return;
+      }
+
+      const ticksUntilReturnWindow = this.nightlyShelterTimingService.getTicksUntilReturnWindow(
+        this.bot.time.timeOfDay,
+      );
+      const waitTicks = Math.max(
+        1,
+        Math.min(this.nightShelterCheckIntervalTicks, ticksUntilReturnWindow),
+      );
+
+      await this.bot.waitForTicks(waitTicks);
+    }
+  }
+
+  private async expandShelterSleepingCapacityAfterMissedNight(
+    rallyPoint: BotRallyPoint,
+  ): Promise<void> {
+    this.ensureScenarioActive();
+    await this.waitForTaskPriority();
+
+    const accessibleBeds = this.countAccessiblePlacedBeds(rallyPoint);
+
+    if (accessibleBeds >= this.minimumShelterBedCount) {
+      this.logger.info(
+        'All required shelter beds are already accessible. Reusing an existing bed during daytime to refresh the spawn point.',
+      );
+      await this.sleepUntilSpawnIsSet(rallyPoint);
+      return;
+    }
+
+    const missingBeds = Math.max(1, this.minimumShelterBedCount - accessibleBeds);
+
+    this.logger.info(
+      `Shelter had only ${accessibleBeds}/${this.minimumShelterBedCount} accessible beds overnight. Gathering sheep and wood for ${missingBeds} additional bed(s).`,
+    );
+    await this.waitForNearbyCraftingTable(rallyPoint);
+    await this.ensureBedsCraftable(rallyPoint, missingBeds);
+    await this.ensurePlanksAvailable(3 * missingBeds);
+
+    const craftedBeds = await this.craftAdditionalBeds(rallyPoint, missingBeds);
+
+    if (craftedBeds < missingBeds) {
+      throw this.createMissingThingError('РєСЂРѕРІР°С‚Рё РґР»СЏ СЂР°СЃС€РёСЂРµРЅРёСЏ РґРѕРјР°');
+    }
+
+    this.logger.info(
+      `Crafted ${craftedBeds} additional bed item(s) after a missed night. Expanding the shelter sleeping capacity.`,
+    );
+    await this.placeBedsUntilShelterCapacity(rallyPoint);
+    await this.sleepUntilSpawnIsSet(rallyPoint);
   }
 
   private async touchBedToSetSpawnPoint(bed: Block): Promise<void> {
@@ -1065,10 +1328,11 @@ export class MineflayerMicroBasePort implements MicroBasePort {
   private findPlacedBedsNearRallyPoint(rallyPoint: BotRallyPoint): Block[] {
     const center = this.toVec3(rallyPoint);
     const beds: Block[] = [];
+    const searchRadius = Math.max(this.houseWidth, this.houseLength);
 
-    for (let dx = -4; dx <= 4; dx += 1) {
+    for (let dx = -searchRadius; dx <= searchRadius; dx += 1) {
       for (let dy = -1; dy <= 2; dy += 1) {
-        for (let dz = -4; dz <= 4; dz += 1) {
+        for (let dz = -searchRadius; dz <= searchRadius; dz += 1) {
           const block = this.bot.blockAt(center.offset(dx, dy, dz));
 
           if (!block || !BED_BLOCK_NAMES.has(block.name)) {
@@ -1180,7 +1444,7 @@ export class MineflayerMicroBasePort implements MicroBasePort {
   }
 
   private countPlacedBedsNearRallyPoint(rallyPoint: BotRallyPoint): number {
-    return Math.floor(this.countPlacedBedBlocksNearRallyPoint(rallyPoint) / 2);
+    return this.getUniquePlacedBedsNearRallyPoint(rallyPoint).length;
   }
 
   private isShelterReadyForSpawn(rallyPoint: BotRallyPoint): boolean {
@@ -1221,26 +1485,18 @@ export class MineflayerMicroBasePort implements MicroBasePort {
   }
 
   private isShelterTraversable(rallyPoint: BotRallyPoint): boolean {
-    return this.shelterLayout
-      .getDoorwayPassagePositions(rallyPoint)
-      .every((position) => this.isPassableStandPosition(position));
+    const doorPosition = this.getShelterDoorPosition(rallyPoint);
+    const interiorAnchor = this.findActualShelterInteriorAnchor(rallyPoint);
+
+    return !!interiorAnchor && this.isPassableStandPosition(this.toBlockPosition(doorPosition)) && this.isPassableStandPosition(this.toBlockPosition(interiorAnchor));
   }
 
   private arePlacedBedsAccessible(rallyPoint: BotRallyPoint): boolean {
-    return this.shelterLayout.getBedFootPositions(rallyPoint).every((bedPosition) => {
-      return (
-        this.hasPlacedBedAtPosition(bedPosition, rallyPoint) &&
-        this.shelterLayout
-          .getBedAccessCandidatePositions(rallyPoint, bedPosition)
-          .some((candidate) => this.isPassableStandPosition(candidate))
-      );
-    });
+    return this.countAccessiblePlacedBeds(rallyPoint) >= this.minimumShelterBedCount;
   }
 
   private hasAllExpectedBedsPlaced(rallyPoint: BotRallyPoint): boolean {
-    return this.shelterLayout
-      .getBedFootPositions(rallyPoint)
-      .every((position) => this.hasPlacedBedAtPosition(position, rallyPoint));
+    return this.countPlacedBedsNearRallyPoint(rallyPoint) >= this.minimumShelterBedCount;
   }
 
   private hasPlacedBedAtPosition(position: BlockPosition, rallyPoint: BotRallyPoint): boolean {
@@ -1249,6 +1505,20 @@ export class MineflayerMicroBasePort implements MicroBasePort {
     return this.getUniquePlacedBedsNearRallyPoint(rallyPoint).some((bed) => {
       return this.toBlockKey(bed.position) === blockKey;
     });
+  }
+
+  private countAccessiblePlacedBeds(rallyPoint: BotRallyPoint): number {
+    return this.getUniquePlacedBedsNearRallyPoint(rallyPoint).filter((bed) => {
+      return this.getActualBedAccessCandidatePositions(bed.position).some((candidate) =>
+        this.isPassableStandPosition(candidate),
+      );
+    }).length;
+  }
+
+  private getActualBedAccessCandidatePositions(position: Vec3): BlockPosition[] {
+    return this.getCardinalOffsets().map((offset) =>
+      this.toBlockPosition(position.plus(offset)),
+    );
   }
 
   private isPassableStandPosition(position: BlockPosition): boolean {
@@ -1361,24 +1631,44 @@ export class MineflayerMicroBasePort implements MicroBasePort {
     return this.toBlockVec3(this.shelterLayout.getOrigin(rallyPoint));
   }
 
-  private async moveInsideShelter(rallyPoint: BotRallyPoint): Promise<void> {
+  private async moveInsideShelter(
+    rallyPoint: BotRallyPoint,
+    closeDoorAfterEntry = false,
+  ): Promise<void> {
+    const doorPosition = this.getShelterDoorPosition(rallyPoint);
+
     if (this.isBotInsideShelter(rallyPoint)) {
       await this.navigateTo(this.getShelterInteriorAnchor(rallyPoint), 1);
+
+      if (closeDoorAfterEntry) {
+        await this.closeShelterDoorIfOpen(doorPosition);
+      }
+
       return;
     }
 
-    await this.enterShelterThroughDoor(rallyPoint);
+    await this.enterShelterThroughDoor(rallyPoint, closeDoorAfterEntry);
   }
 
-  private async enterShelterThroughDoor(rallyPoint: BotRallyPoint): Promise<void> {
+  private async enterShelterThroughDoor(
+    rallyPoint: BotRallyPoint,
+    closeDoorAfterEntry = false,
+  ): Promise<void> {
     const doorPosition = this.getShelterDoorPosition(rallyPoint);
-    const outsideApproach = doorPosition.offset(0, 0, 1);
     const interiorAnchor = this.getShelterInteriorAnchor(rallyPoint);
+    const outsideApproach =
+      this.getDoorApproachPositions(doorPosition, rallyPoint).find(
+        (position) =>
+          !this.isInsideShelterArea(position, rallyPoint) &&
+          this.isPassableStandPosition(this.toBlockPosition(position)),
+      ) ??
+      doorPosition;
+
     await this.navigateTo(outsideApproach, 1).catch(() => undefined);
     await this.openShelterDoorIfNeeded(doorPosition);
 
     if (!this.isBotInsideShelter(rallyPoint)) {
-      await this.stepTowards(interiorAnchor, 14);
+      await this.stepTowards(interiorAnchor, 16);
     }
 
     if (!this.isBotInsideShelter(rallyPoint)) {
@@ -1388,14 +1678,116 @@ export class MineflayerMicroBasePort implements MicroBasePort {
     if (!this.isBotInsideShelter(rallyPoint)) {
       throw new Error('Could not enter the shelter through the door.');
     }
+
+    if (closeDoorAfterEntry) {
+      await this.closeShelterDoorIfOpen(doorPosition);
+      this.logger.info(
+        `Entered the shelter through the door at ${doorPosition.x} ${doorPosition.y} ${doorPosition.z} and closed it behind the bot.`,
+      );
+    }
   }
 
   private getShelterInteriorAnchor(rallyPoint: BotRallyPoint): Vec3 {
-    return this.toBlockVec3(this.shelterLayout.getInteriorAnchor(rallyPoint));
+    return (
+      this.findActualShelterInteriorAnchor(rallyPoint) ??
+      this.toBlockVec3(this.shelterLayout.getInteriorAnchor(rallyPoint))
+    );
   }
 
   private getShelterDoorPosition(rallyPoint: BotRallyPoint): Vec3 {
-    return this.toBlockVec3(this.shelterLayout.getDoorPosition(rallyPoint));
+    return (
+      this.findActualShelterDoorPosition(rallyPoint) ??
+      this.toBlockVec3(this.shelterLayout.getDoorPosition(rallyPoint))
+    );
+  }
+
+  private findActualShelterDoorPosition(rallyPoint: BotRallyPoint): Vec3 | null {
+    const center = this.toVec3(rallyPoint);
+    const seenDoorPositions = new Set<string>();
+    let bestDoor: Vec3 | null = null;
+    let bestScore = Number.POSITIVE_INFINITY;
+
+    for (let dx = -this.shelterDoorSearchRadius; dx <= this.shelterDoorSearchRadius; dx += 1) {
+      for (let dy = -1; dy <= 2; dy += 1) {
+        for (let dz = -this.shelterDoorSearchRadius; dz <= this.shelterDoorSearchRadius; dz += 1) {
+          const candidate = this.bot.blockAt(center.offset(dx, dy, dz));
+
+          if (!candidate || !this.isDoorBlock(candidate)) {
+            continue;
+          }
+
+          const normalizedDoor = this.normalizeDoorBlock(candidate);
+
+          if (!normalizedDoor) {
+            continue;
+          }
+
+          const key = this.toBlockKey(normalizedDoor.position);
+
+          if (seenDoorPositions.has(key)) {
+            continue;
+          }
+
+          seenDoorPositions.add(key);
+          const interiorAnchor = this.findDoorInteriorAnchor(normalizedDoor.position, rallyPoint);
+          const score =
+            normalizedDoor.position.distanceSquared(center) +
+            (interiorAnchor ? interiorAnchor.distanceSquared(center) : 1000);
+
+          if (score < bestScore) {
+            bestScore = score;
+            bestDoor = normalizedDoor.position.clone();
+          }
+        }
+      }
+    }
+
+    return bestDoor;
+  }
+
+  private findActualShelterInteriorAnchor(rallyPoint: BotRallyPoint): Vec3 | null {
+    return this.findDoorInteriorAnchor(this.getShelterDoorPosition(rallyPoint), rallyPoint);
+  }
+
+  private findDoorInteriorAnchor(doorPosition: Vec3, rallyPoint: BotRallyPoint): Vec3 | null {
+    const rallyCenter = this.toVec3(rallyPoint);
+
+    return this.getDoorApproachPositions(doorPosition, rallyPoint)
+      .filter((position) => this.isPassableStandPosition(this.toBlockPosition(position)))
+      .sort((left, right) => left.distanceSquared(rallyCenter) - right.distanceSquared(rallyCenter))[0] ?? null;
+  }
+
+  private getDoorApproachPositions(doorPosition: Vec3, rallyPoint: BotRallyPoint): Vec3[] {
+    const rallyCenter = this.toVec3(rallyPoint);
+
+    return this.getCardinalOffsets()
+      .map((offset) => doorPosition.plus(offset))
+      .sort((left, right) => left.distanceSquared(rallyCenter) - right.distanceSquared(rallyCenter));
+  }
+
+  private normalizeDoorBlock(block: Block): Block | null {
+    if (!this.isDoorBlock(block)) {
+      return null;
+    }
+
+    if (block.getProperties().half === 'upper') {
+      const lowerDoorBlock = this.bot.blockAt(block.position.offset(0, -1, 0));
+
+      if (lowerDoorBlock && this.isDoorBlock(lowerDoorBlock)) {
+        return lowerDoorBlock;
+      }
+    }
+
+    return block;
+  }
+
+  private getCardinalOffsets(): Vec3[] {
+    return [
+      new Vec3(1, 0, 0),
+      new Vec3(-1, 0, 0),
+      new Vec3(0, 0, 1),
+      new Vec3(0, 0, -1),
+    ];
   }
 
   private isDoorBlock(block: Block): boolean {
@@ -1425,6 +1817,33 @@ export class MineflayerMicroBasePort implements MicroBasePort {
     }
   }
 
+  private async closeShelterDoorIfOpen(doorPosition: Vec3): Promise<void> {
+    const lowerDoorBlock = this.bot.blockAt(doorPosition);
+
+    if (lowerDoorBlock && this.isDoorBlock(lowerDoorBlock) && lowerDoorBlock.getProperties().open === true) {
+      await this.bot.lookAt(doorPosition.offset(0.5, 0.5, 0.5), true).catch(() => undefined);
+      await this.bot.activateBlock(lowerDoorBlock).catch(() => undefined);
+      await this.bot.waitForTicks(10);
+    }
+
+    const refreshedLowerDoorBlock = this.bot.blockAt(doorPosition);
+    const upperDoorBlock = this.bot.blockAt(doorPosition.offset(0, 1, 0));
+
+    if (
+      refreshedLowerDoorBlock &&
+      this.isDoorBlock(refreshedLowerDoorBlock) &&
+      refreshedLowerDoorBlock.getProperties().open !== true
+    ) {
+      return;
+    }
+
+    if (upperDoorBlock && this.isDoorBlock(upperDoorBlock) && upperDoorBlock.getProperties().open === true) {
+      await this.bot.lookAt(doorPosition.offset(0.5, 1.5, 0.5), true).catch(() => undefined);
+      await this.bot.activateBlock(upperDoorBlock).catch(() => undefined);
+      await this.bot.waitForTicks(10);
+    }
+  }
+
   private async stepTowards(target: Vec3, ticks: number): Promise<void> {
     await this.bot.lookAt(target.offset(0.5, 0, 0.5), true).catch(() => undefined);
     this.bot.setControlState('forward', true);
@@ -1441,16 +1860,11 @@ export class MineflayerMicroBasePort implements MicroBasePort {
       return false;
     }
 
-    const position = this.bot.entity.position.floored();
+    return this.isInsideShelterArea(this.bot.entity.position.floored(), rallyPoint);
+  }
 
-    return this.shelterLayout.isInsideInterior(
-      {
-        x: position.x,
-        y: position.y,
-        z: position.z,
-      },
-      rallyPoint,
-    );
+  private isInsideShelterArea(position: Vec3, rallyPoint: BotRallyPoint): boolean {
+    return this.shelterLayout.isInsideInterior(this.toBlockPosition(position), rallyPoint);
   }
 
   private isShelterDoorOpeningPosition(position: Vec3, rallyPoint: BotRallyPoint): boolean {
@@ -1465,6 +1879,14 @@ export class MineflayerMicroBasePort implements MicroBasePort {
 
   private toBlockVec3(position: BlockPosition): Vec3 {
     return new Vec3(position.x, position.y, position.z);
+  }
+
+  private toBlockPosition(position: Vec3): BlockPosition {
+    return {
+      x: Math.floor(position.x),
+      y: Math.floor(position.y),
+      z: Math.floor(position.z),
+    };
   }
 
   private stringifyError(error: unknown): string {

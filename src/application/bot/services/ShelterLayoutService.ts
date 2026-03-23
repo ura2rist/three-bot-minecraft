@@ -171,6 +171,23 @@ export class ShelterLayoutService {
     return candidates.filter((candidate) => this.isInsideInterior(candidate, rallyPoint));
   }
 
+  getInteriorFloorPositions(rallyPoint: BotRallyPoint): BlockPosition[] {
+    const origin = this.getOrigin(rallyPoint);
+    const positions: BlockPosition[] = [];
+
+    for (let z = 1; z < this.dimensions.length - 1; z += 1) {
+      for (let x = 1; x < this.dimensions.width - 1; x += 1) {
+        positions.push({
+          x: origin.x + x,
+          y: origin.y,
+          z: origin.z + z,
+        });
+      }
+    }
+
+    return positions;
+  }
+
   isInsideInterior(position: BlockPosition, rallyPoint: BotRallyPoint): boolean {
     const origin = this.getOrigin(rallyPoint);
     const minX = origin.x + 1;

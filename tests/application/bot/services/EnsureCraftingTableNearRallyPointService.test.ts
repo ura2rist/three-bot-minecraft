@@ -83,3 +83,63 @@ test('EnsureCraftingTableNearRallyPointService gathers logs when nothing can be 
   await service.execute(configuration);
   assert.equal(gatherCalls, 1);
 });
+
+test('EnsureCraftingTableNearRallyPointService exits early when the crafting table already exists', async () => {
+  let placementCalls = 0;
+  const service = new EnsureCraftingTableNearRallyPointService(
+    {
+      prepareFleet: () => undefined,
+      getAssignedUsername: () => 'Gimli',
+      isAssignedCrafter: () => true,
+    },
+    {
+      hasCraftingTableNearRallyPoint: async () => true,
+      placeCraftingTableNearRallyPoint: async () => {
+        placementCalls += 1;
+      },
+    },
+    {
+      hasItem: async () => false,
+      craftCraftingTable: async () => false,
+      craftPlanksFromInventoryLogs: async () => false,
+    },
+    {
+      gatherNearestLog: async () => {
+        throw new Error('should not gather');
+      },
+    },
+    new TestLogger(),
+  );
+
+  await service.execute(configuration);
+  assert.equal(placementCalls, 0);
+});
+
+test('EnsureCraftingTableNearRallyPointService throws when it cannot gather enough resources', async () => {
+  let gatherCalls = 0;
+  const service = new EnsureCraftingTableNearRallyPointService(
+    {
+      prepareFleet: () => undefined,
+      getAssignedUsername: () => 'Gimli',
+      isAssignedCrafter: () => true,
+    },
+    {
+      hasCraftingTableNearRallyPoint: async () => false,
+      placeCraftingTableNearRallyPoint: async () => undefined,
+    },
+    {
+      hasItem: async () => false,
+      craftCraftingTable: async () => false,
+      craftPlanksFromInventoryLogs: async () => false,
+    },
+    {
+      gatherNearestLog: async () => {
+        gatherCalls += 1;
+      },
+    },
+    new TestLogger(),
+  );
+
+  await assert.rejects(() => service.execute(configuration), /crafting table/i);
+  assert.equal(gatherCalls, 4);
+});

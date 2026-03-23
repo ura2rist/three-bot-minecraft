@@ -25,3 +25,17 @@ test('SquadWeaponReadinessTracker stops waiting when the scenario is inactive', 
   await tracker.waitUntilAllReady(['Gamgee'], () => false);
   assert.equal(tracker.areAllReady(['Gamgee']), false);
 });
+
+test('SquadWeaponReadinessTracker clearReady and reset roll readiness back', () => {
+  const tracker = new SquadWeaponReadinessTracker();
+
+  tracker.markReady('Gamgee');
+  tracker.markReady('Gimli');
+  assert.equal(tracker.areAllReady(['Gamgee', 'Gimli']), true);
+
+  tracker.clearReady('Gimli');
+  assert.equal(tracker.areAllReady(['Gamgee', 'Gimli']), false);
+
+  tracker.reset();
+  assert.equal(tracker.areAllReady(['Gamgee']), false);
+});

@@ -34,8 +34,37 @@ test('ShelterLayoutService exposes roof and wall geometry for the taller house',
   ]);
 });
 
+test('ShelterLayoutService exposes doorway passage and roof standing positions for navigation helpers', () => {
+  assert.deepEqual(layout.getDoorwayPassagePositions(rallyPoint), [
+    { x: 215, y: 64, z: -75 },
+    { x: 215, y: 64, z: -76 },
+  ]);
+  assert.deepEqual(layout.getRoofAccessStandingPosition(rallyPoint), {
+    x: 220,
+    y: 67,
+    z: -79,
+  });
+});
+
 test('ShelterLayoutService reports whether a position is inside the interior', () => {
   assert.equal(layout.isInsideInterior({ x: 215, y: 64, z: -76 }, rallyPoint), true);
   assert.equal(layout.isInsideInterior({ x: 215, y: 64, z: -75 }, rallyPoint), false);
   assert.equal(layout.isInsideInterior({ x: 213, y: 65, z: -78 }, rallyPoint), false);
+});
+
+test('ShelterLayoutService exposes all interior floor positions for adaptive bed placement', () => {
+  const interiorFloorPositions = layout.getInteriorFloorPositions(rallyPoint);
+
+  assert.equal(interiorFloorPositions.length, 28);
+  assert.deepEqual(interiorFloorPositions[0], { x: 212, y: 64, z: -79 });
+  assert.deepEqual(interiorFloorPositions.at(-1), { x: 218, y: 64, z: -76 });
+});
+
+test('ShelterLayoutService keeps bed access candidates inside the shelter interior', () => {
+  assert.deepEqual(layout.getBedAccessCandidatePositions(rallyPoint, { x: 213, y: 64, z: -78 }), [
+    { x: 213, y: 64, z: -77 },
+    { x: 213, y: 64, z: -79 },
+    { x: 212, y: 64, z: -78 },
+    { x: 214, y: 64, z: -78 },
+  ]);
 });

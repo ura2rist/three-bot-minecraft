@@ -30,3 +30,38 @@ test('BotPriorityCoordinator does not let threats interrupt rally phase', () => 
   assert.equal(coordinator.canInterruptWithThreatResponse(), false);
   assert.equal(coordinator.isThreatResponseActive(), false);
 });
+
+test('BotPriorityCoordinator lets night shelter override an active threat response', () => {
+  const coordinator = new BotPriorityCoordinator();
+  coordinator.onRallyStarted();
+  coordinator.onRallyCompleted();
+  coordinator.onTaskStarted('escort');
+  coordinator.onThreatEngaged();
+
+  assert.equal(coordinator.isThreatResponseActive(), true);
+
+  coordinator.onTaskStarted('night_shelter');
+
+  assert.equal(coordinator.canInterruptWithThreatResponse(), false);
+  assert.equal(coordinator.isThreatResponseActive(), false);
+});
+
+test('BotPriorityCoordinator resets task and threats on respawn and death', () => {
+  const coordinator = new BotPriorityCoordinator();
+  coordinator.onRallyStarted();
+  coordinator.onRallyCompleted();
+  coordinator.onTaskStarted('resource_gathering');
+  coordinator.onThreatEngaged();
+
+  coordinator.onRespawned();
+  assert.equal(coordinator.getCurrentTask(), 'idle');
+  assert.equal(coordinator.isThreatResponseActive(), false);
+
+  coordinator.onRallyCompleted();
+  coordinator.onTaskStarted('escort');
+  coordinator.onThreatEngaged();
+  coordinator.onBotDied();
+
+  assert.equal(coordinator.getCurrentTask(), 'idle');
+  assert.equal(coordinator.isThreatResponseActive(), false);
+});

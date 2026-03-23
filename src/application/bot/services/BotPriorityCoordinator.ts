@@ -42,6 +42,11 @@ export class BotPriorityCoordinator {
     }
 
     this.currentTask = task;
+
+    if (task === 'night_shelter') {
+      this.activeThreats = 0;
+      this.resolveResumeWaiters();
+    }
   }
 
   onTaskCompleted(task: BotTaskName): void {
@@ -51,7 +56,7 @@ export class BotPriorityCoordinator {
   }
 
   onThreatEngaged(): void {
-    if (this.phase !== 'mission') {
+    if (!this.canInterruptWithThreatResponse()) {
       return;
     }
 
@@ -67,11 +72,11 @@ export class BotPriorityCoordinator {
   }
 
   canInterruptWithThreatResponse(): boolean {
-    return this.phase === 'mission';
+    return this.phase === 'mission' && this.currentTask !== 'night_shelter';
   }
 
   isThreatResponseActive(): boolean {
-    return this.phase === 'mission' && this.activeThreats > 0;
+    return this.canInterruptWithThreatResponse() && this.activeThreats > 0;
   }
 
   async waitUntilTaskMayProceed(isScenarioActive: () => boolean): Promise<void> {
