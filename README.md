@@ -36,6 +36,8 @@ npm run dev
 3. `/login <password>`
 4. отправка сообщения `hi`
 
+Требование к дальнейшему развитию micro-base сценария: после того как боты сделают себе постели внутри укрытия, следующим шагом нужно сделать для них сундуки.
+
 ## Сборка
 
 Сборка TypeScript в `dist`:
@@ -58,6 +60,7 @@ npm run start
 
 - `.env` хранит общие технические параметры для всех ботов: `host`, `port`, `version`, `auth`.
 - `bots.config.json` хранит только данные конкретных ботов: `role`, `username`, `password`, `rallyPoint`.
+- `configs/roles/trading.json` хранит основной торговый сценарий бота с ролью `trading`.
 - Допустимые роли строго ограничены: `farm`, `trading`, `mine`.
 - Каждая роль может быть указана только один раз.
 - Пароль обязателен, потому что используется для регистрации и логина через LightAuth.
@@ -166,7 +169,7 @@ BOT_CONNECT_MAX_RETRIES=2
         { "itemId": "bread", "amount": 2 }
       ],
       "botGives": [
-        { "itemId": "iron_ingot", "amount": 1 }
+        { "itemId": "white_wool", "amount": 1 }
       ]
     }
   ]
@@ -187,6 +190,7 @@ BOT_CONNECT_MAX_RETRIES=2
 - `BOT_CONNECT_RETRY_DELAY_MS` - пауза перед повторной попыткой после `Connection throttled`.
 - `BOT_CONNECT_MAX_RETRIES` - сколько раз повторять попытку подключения при throttle.
 - `LOG_FILE_PATH` - путь до файла общего логгера. По умолчанию `./logs/app.log`.
+- `TRADING_ROLE_CONFIG_PATH` - путь до файла торговых офферов роли `trading`. По умолчанию `./configs/roles/trading.json`.
 - `LIGHTAUTH_REGISTER_COMMAND` - команда регистрации, по умолчанию `/register`.
 - `LIGHTAUTH_LOGIN_COMMAND` - команда логина, по умолчанию `/login`.
 - `LIGHTAUTH_COMMAND_DELAY_MS` - задержка между auth-командами.

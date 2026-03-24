@@ -20,6 +20,7 @@ export class MineflayerNearbyDroppedItemCollector {
   private readonly pickupGoalRange = 1;
   private collectionPromise: Promise<boolean> | null = null;
   private intervalId: NodeJS.Timeout | null = null;
+  private backgroundCollectionSuppressedUntil = 0;
 
   constructor(
     private readonly bot: BotWithPathfinder,
@@ -34,6 +35,10 @@ export class MineflayerNearbyDroppedItemCollector {
     }
 
     this.intervalId = setInterval(() => {
+      if (Date.now() < this.backgroundCollectionSuppressedUntil) {
+        return;
+      }
+
       if (!this.mayCollectInBackground()) {
         return;
       }
@@ -51,6 +56,13 @@ export class MineflayerNearbyDroppedItemCollector {
 
     clearInterval(this.intervalId);
     this.intervalId = null;
+  }
+
+  pauseBackgroundCollectionFor(durationMs: number): void {
+    this.backgroundCollectionSuppressedUntil = Math.max(
+      this.backgroundCollectionSuppressedUntil,
+      Date.now() + Math.max(0, durationMs),
+    );
   }
 
   async collectAroundBot(): Promise<boolean> {

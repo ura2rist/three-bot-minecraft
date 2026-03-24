@@ -7,11 +7,13 @@ import { BotThreatPrioritySubscriber } from '../../application/bot/subscribers/B
 import { BotPriorityCoordinator } from '../../application/bot/services/BotPriorityCoordinator';
 import { SquadWeaponReadinessTracker } from '../../application/bot/services/SquadWeaponReadinessTracker';
 import { BotClient } from '../../application/bot/ports/BotClient';
+import { TradingRoleSettingsProvider } from '../../application/bot/ports/TradingRoleSettingsProvider';
 import { EstablishMicroBaseService } from '../../application/bot/services/EstablishMicroBaseService';
 import { DeterministicMicroBaseAssignmentPolicy } from '../../application/bot/services/DeterministicMicroBaseAssignmentPolicy';
 import { EnsureCraftingTableNearRallyPointService } from '../../application/bot/services/EnsureCraftingTableNearRallyPointService';
 import { RandomCraftingTableAssignmentPolicy } from '../../application/bot/services/RandomCraftingTableAssignmentPolicy';
 import { BotConfiguration } from '../../domain/bot/entities/BotConfiguration';
+import { TradingRoleSettings } from '../../domain/bot/entities/RoleSettings';
 import { Logger } from '../../application/shared/ports/Logger';
 import { LightAuthBotAuthenticator } from './LightAuthBotAuthenticator';
 import { MineflayerAutoEatController } from './MineflayerAutoEatController';
@@ -22,6 +24,7 @@ import { MicroBaseScenarioCancelledError, MineflayerMicroBasePort } from './Mine
 import { MineflayerNearbyDroppedItemCollector } from './MineflayerNearbyDroppedItemCollector';
 import { MineflayerLogHarvestingPort } from './MineflayerLogHarvestingPort';
 import { MineflayerSquadDefenseController } from './MineflayerSquadDefenseController';
+import { MineflayerTradingRoutine } from './MineflayerTradingRoutine';
 import type { BotWithPathfinder, PathfinderApi, PathfinderMovements } from './MineflayerPortsShared';
 import { InMemoryEventBus } from '../events/InMemoryEventBus';
 
@@ -105,8 +108,14 @@ export class MineflayerBotClient implements BotClient {
   private readonly reconnectingBots = new Set<string>();
   private readonly friendlyUsernames = new Set<string>();
   private readonly connectedPathfinderBots = new Map<string, BotWithClient>();
+  private readonly tradingRoleSettings: TradingRoleSettings;
 
-  constructor(private readonly logger: Logger) {}
+  constructor(
+    private readonly logger: Logger,
+    tradingRoleSettingsProvider: TradingRoleSettingsProvider,
+  ) {
+    this.tradingRoleSettings = tradingRoleSettingsProvider.load();
+  }
 
   prepareFleet(configurations: readonly BotConfiguration[]): void {
     this.craftingTableAssignmentPolicy.prepareFleet(configurations);
@@ -204,6 +213,7 @@ export class MineflayerBotClient implements BotClient {
     let microBaseScenarioStarted = false;
     let microBaseScenarioGeneration = 0;
     let nightlyShelterRoutineStarted = false;
+    let tradingRoutineStarted = false;
     let spawnCount = 0;
     let configurationSettingsSent = false;
     let configurationFallbackTriggered = false;
@@ -257,6 +267,7 @@ export class MineflayerBotClient implements BotClient {
       microBaseScenarioGeneration += 1;
       microBaseScenarioStarted = false;
       nightlyShelterRoutineStarted = false;
+      tradingRoutineStarted = false;
       bot.pathfinder?.stop();
       logger.info(`Stopped active scenarios: ${reason}.`);
     };
@@ -409,6 +420,45 @@ export class MineflayerBotClient implements BotClient {
           }
         });
     };
+    const startTradingRoutine = (scenarioGeneration: number, microBaseLogger: Logger) => {
+      if (
+        configuration.role !== 'trading' ||
+        !configuration.rallyPoint ||
+        tradingRoutineStarted
+      ) {
+        return;
+      }
+
+      tradingRoutineStarted = true;
+      const tradingLogger = logger.child('trading-main');
+      const tradingRoutine = new MineflayerTradingRoutine(
+        this.requirePathfinderBot(bot),
+        tradingLogger,
+        configuration.rallyPoint,
+        this.tradingRoleSettings,
+        (target, range) => this.gotoPosition(this.requirePathfinderBot(bot), target, range),
+        () => scenarioGeneration === microBaseScenarioGeneration,
+        createScenarioWaiter(scenarioGeneration),
+        (delayMs) => getNearbyDroppedItemCollector().pauseBackgroundCollectionFor(delayMs),
+      );
+
+      void tradingRoutine
+        .maintain()
+        .catch((error) => {
+          if (scenarioGeneration !== microBaseScenarioGeneration) {
+            return;
+          }
+
+          tradingLogger.warn(
+            `Trading main routine stopped unexpectedly: ${this.stringifyError(error)}.`,
+          );
+        })
+        .finally(() => {
+          if (scenarioGeneration === microBaseScenarioGeneration) {
+            tradingRoutineStarted = false;
+          }
+        });
+    };
     const startMicroBaseScenario = () => {
       if (!configuration.rallyPoint || microBaseScenarioStarted) {
         return;
@@ -439,6 +489,7 @@ export class MineflayerBotClient implements BotClient {
           }
 
           startNightlyShelterRoutine(scenarioGeneration, microBaseLogger);
+          startTradingRoutine(scenarioGeneration, microBaseLogger);
         })
         .catch(async (error) => {
           if (error instanceof MicroBaseScenarioCancelledError) {
@@ -455,6 +506,7 @@ export class MineflayerBotClient implements BotClient {
             );
             microBaseScenarioStarted = false;
             nightlyShelterRoutineStarted = false;
+            tradingRoutineStarted = false;
             await priorityCoordinator.waitUntilTaskMayProceed(
               () => scenarioGeneration === microBaseScenarioGeneration,
             );
