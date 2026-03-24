@@ -36,6 +36,7 @@ export class MineflayerLogHarvestingPort implements LogHarvestingPort {
   private readonly pickupWaitMs = 3000;
   private readonly pickupHorizontalRange = 6;
   private readonly pickupVerticalRange = 4;
+  private readonly maxLoggedSkippedCandidates = 5;
 
   constructor(
     private readonly bot: BotWithPathfinder,
@@ -75,6 +76,8 @@ export class MineflayerLogHarvestingPort implements LogHarvestingPort {
     }
 
     let lastRetryableError: RetryableTargetSelectionError | null = null;
+    const skippedCandidates: string[] = [];
+    let skippedCandidateCount = 0;
 
     for (const targetLog of candidateLogs) {
       try {
@@ -86,10 +89,28 @@ export class MineflayerLogHarvestingPort implements LogHarvestingPort {
         }
 
         lastRetryableError = error;
-        this.logger.warn(
-          `Skipping log block ${targetLog.name} at ${targetLog.position.x} ${targetLog.position.y} ${targetLog.position.z}: ${error.message}`,
-        );
+        skippedCandidateCount += 1;
+
+        if (skippedCandidates.length < this.maxLoggedSkippedCandidates) {
+          skippedCandidates.push(
+            `${targetLog.name} at ${targetLog.position.x} ${targetLog.position.y} ${targetLog.position.z}: ${error.message}`,
+          );
+        }
       }
+    }
+
+    if (skippedCandidateCount > 0) {
+      const remainingSkippedCandidates = skippedCandidateCount - skippedCandidates.length;
+      const remainingSkippedSuffix =
+        remainingSkippedCandidates > 0
+          ? `; and ${remainingSkippedCandidates} more candidate(s)`
+          : '';
+
+      this.logger.warn(
+        `Skipped ${skippedCandidateCount} unreachable log candidate(s) while searching for a reachable tree. Samples: ${skippedCandidates.join(
+          '; ',
+        )}${remainingSkippedSuffix}.`,
+      );
     }
 
     throw lastRetryableError ?? new Error('Could not gather any reachable log block from the current search set.');

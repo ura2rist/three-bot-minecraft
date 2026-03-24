@@ -149,3 +149,96 @@ test('MineflayerMicroBasePort skips shelter construction when the structure and 
 
   assert.equal(buildShelterCalls, 0);
 });
+
+test('MineflayerMicroBasePort reuses an existing shelter instead of restarting the bootstrap flow', async () => {
+  const port = createPort([]) as any;
+  let sleepUntilSpawnIsSetCalls = 0;
+
+  port.isShelterReadyForSpawn = () => true;
+  port.sleepUntilSpawnIsSet = async () => {
+    sleepUntilSpawnIsSetCalls += 1;
+  };
+
+  const resumed = await port.resumeExistingShelterIfReady(rallyPoint);
+
+  assert.equal(resumed, true);
+  assert.equal(sleepUntilSpawnIsSetCalls, 1);
+});
+
+test('MineflayerMicroBasePort closes the shelter door right before sleeping for the night', async () => {
+  const bed = {
+    position: new Vec3(213, 64, -79),
+    getProperties: () => ({ occupied: false }),
+  };
+  const port = createPort([]) as any;
+  let closeDoorCalls = 0;
+  let sleepCalls = 0;
+
+  port.moveInsideShelter = async () => undefined;
+  port.getBedSelectionOrder = () => [bed];
+  port.isBedOccupied = () => false;
+  port.isSleepWindow = () => true;
+  port.ensureShelterDoorClosedBeforeSleeping = async () => {
+    closeDoorCalls += 1;
+  };
+  port.navigateTo = async () => undefined;
+  port.bot.sleep = async () => {
+    sleepCalls += 1;
+    port.bot.isSleeping = true;
+  };
+
+  const slept = await port.sleepInShelterForTheNight(rallyPoint);
+
+  assert.equal(slept, true);
+  assert.equal(closeDoorCalls, 1);
+  assert.equal(sleepCalls, 1);
+});
+
+test('MineflayerMicroBasePort retries entering the shelter when another bot closes the door too early', async () => {
+  const port = createPort([]) as any;
+  let openDoorCalls = 0;
+  let stepTowardsCalls = 0;
+  let inside = false;
+
+  port.getShelterDoorPosition = () => new Vec3(215, 64, -80);
+  port.getShelterInteriorAnchor = () => new Vec3(215, 64, -78);
+  port.getDoorApproachPositions = () => [new Vec3(215, 64, -81)];
+  port.isPassableStandPosition = () => true;
+  port.isInsideShelterArea = () => false;
+  port.isBotInsideShelter = () => inside;
+  port.navigateTo = async (_target: Vec3, range: number) => {
+    if (range === 1 && openDoorCalls >= 2) {
+      inside = true;
+    }
+  };
+  port.openShelterDoorIfNeeded = async () => {
+    openDoorCalls += 1;
+  };
+  port.stepTowards = async () => {
+    stepTowardsCalls += 1;
+  };
+  port.bot.waitForTicks = async () => undefined;
+
+  await port.enterShelterThroughDoor(rallyPoint, false);
+
+  assert.equal(openDoorCalls, 2);
+  assert.equal(stepTowardsCalls, 2);
+});
+
+test('MineflayerMicroBasePort schedules a delayed shelter-door close after entry', async () => {
+  const port = createPort([]) as any;
+  let closeDoorCalls = 0;
+
+  port.bot.waitForTicks = async () => undefined;
+  port.isBotInsideShelter = () => true;
+  port.getShelterDoorPosition = () => new Vec3(215, 64, -80);
+  port.isShelterDoorOpen = () => true;
+  port.closeShelterDoorIfOpen = async () => {
+    closeDoorCalls += 1;
+  };
+
+  port.scheduleShelterDoorClose(rallyPoint);
+  await new Promise((resolve) => setTimeout(resolve, 0));
+
+  assert.equal(closeDoorCalls, 1);
+});

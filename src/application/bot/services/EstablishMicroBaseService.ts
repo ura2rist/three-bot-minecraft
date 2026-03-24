@@ -47,6 +47,13 @@ export class EstablishMicroBaseService {
     });
 
     try {
+      if (await this.microBasePort.resumeExistingShelterIfReady(configuration.rallyPoint)) {
+        this.logger.info(
+          'A ready shelter with accessible beds already exists near the rally point. Skipping the micro-base bootstrap and reusing the shelter.',
+        );
+        return;
+      }
+
       this.logger.info('Ensuring a wooden sword before the micro-base scenario.');
       await this.microBasePort.ensureWoodenSwordNearRallyPoint(configuration.rallyPoint);
       this.squadWeaponReadinessTracker.markReady(configuration.username);

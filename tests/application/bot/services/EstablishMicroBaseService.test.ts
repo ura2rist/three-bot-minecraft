@@ -34,6 +34,7 @@ test('EstablishMicroBaseService runs the leader flow after the squad is ready', 
   const service = new EstablishMicroBaseService(
     assignmentPolicy,
     {
+      resumeExistingShelterIfReady: async () => false,
       ensureWoodenSwordNearRallyPoint: async () => {
         ensuredSword += 1;
       },
@@ -66,6 +67,7 @@ test('EstablishMicroBaseService runs escort flow for a non-leader', async () => 
   const service = new EstablishMicroBaseService(
     assignmentPolicy,
     {
+      resumeExistingShelterIfReady: async () => false,
       ensureWoodenSwordNearRallyPoint: async () => undefined,
       establishAtRallyPoint: async () => {
         throw new Error('leader flow should not run');
@@ -105,6 +107,7 @@ test('EstablishMicroBaseService publishes task lifecycle events around the leade
   const service = new EstablishMicroBaseService(
     assignmentPolicy,
     {
+      resumeExistingShelterIfReady: async () => false,
       ensureWoodenSwordNearRallyPoint: async () => undefined,
       establishAtRallyPoint: async () => undefined,
       supportLeader: async () => undefined,
@@ -135,6 +138,7 @@ test('EstablishMicroBaseService stops before the leader flow if the scenario bec
   const service = new EstablishMicroBaseService(
     assignmentPolicy,
     {
+      resumeExistingShelterIfReady: async () => false,
       ensureWoodenSwordNearRallyPoint: async () => undefined,
       establishAtRallyPoint: async () => {
         establishCalls += 1;
@@ -171,6 +175,7 @@ test('EstablishMicroBaseService skips the scenario when no rally point is config
   const service = new EstablishMicroBaseService(
     assignmentPolicy,
     {
+      resumeExistingShelterIfReady: async () => false,
       ensureWoodenSwordNearRallyPoint: async () => {
         ensureSwordCalls += 1;
       },
@@ -193,6 +198,7 @@ test('EstablishMicroBaseService skips the scenario when no leader was assigned',
   const service = new EstablishMicroBaseService(
     new DeterministicMicroBaseAssignmentPolicy(),
     {
+      resumeExistingShelterIfReady: async () => false,
       ensureWoodenSwordNearRallyPoint: async () => {
         ensureSwordCalls += 1;
       },
@@ -208,4 +214,36 @@ test('EstablishMicroBaseService skips the scenario when no leader was assigned',
 
   await service.execute(createBot('mine', 'Gimli'));
   assert.equal(ensureSwordCalls, 0);
+});
+
+test('EstablishMicroBaseService reuses an existing shelter and skips the bootstrap flow', async () => {
+  const assignmentPolicy = new DeterministicMicroBaseAssignmentPolicy();
+  const bot = createBot('mine', 'Gimli');
+  assignmentPolicy.prepareFleet([createBot('farm', 'Gamgee'), bot]);
+
+  let ensureSwordCalls = 0;
+  let supportCalls = 0;
+  const service = new EstablishMicroBaseService(
+    assignmentPolicy,
+    {
+      resumeExistingShelterIfReady: async () => true,
+      ensureWoodenSwordNearRallyPoint: async () => {
+        ensureSwordCalls += 1;
+      },
+      establishAtRallyPoint: async () => undefined,
+      supportLeader: async () => {
+        supportCalls += 1;
+      },
+    },
+    new TestLogger(),
+    new InMemoryEventBus<BotActivityEvent>(),
+    new SquadWeaponReadinessTracker(),
+    ['Gamgee', 'Gimli'],
+    () => true,
+  );
+
+  await service.execute(bot);
+
+  assert.equal(ensureSwordCalls, 0);
+  assert.equal(supportCalls, 0);
 });
