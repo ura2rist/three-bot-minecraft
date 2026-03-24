@@ -4,6 +4,8 @@ import { LogEntry, LogLevel, Logger } from '../../application/shared/ports/Logge
 
 export class ConsoleLogger implements Logger {
   private readonly logFilePath = this.resolveLogFilePath(process.env.LOG_FILE_PATH);
+  private readonly infoEnabled = this.parseBoolean(process.env.LOG_INFO_ENABLED, true);
+  private readonly warnEnabled = this.parseBoolean(process.env.LOG_WARN_ENABLED, true);
 
   constructor(
     private readonly entries: LogEntry[] = [],
@@ -43,6 +45,10 @@ export class ConsoleLogger implements Logger {
 
     this.entries.push(entry);
 
+    if (!this.shouldEmit(level)) {
+      return;
+    }
+
     const prefix = [entry.timestamp, level.toUpperCase(), this.context]
       .filter((part): part is string => Boolean(part))
       .join(' ');
@@ -66,6 +72,18 @@ export class ConsoleLogger implements Logger {
     }
 
     console.log(output);
+  }
+
+  private shouldEmit(level: LogLevel): boolean {
+    if (level === 'error') {
+      return true;
+    }
+
+    if (level === 'warn') {
+      return this.warnEnabled;
+    }
+
+    return this.infoEnabled;
   }
 
   private serializeError(error: unknown): string | undefined {
@@ -93,6 +111,24 @@ export class ConsoleLogger implements Logger {
 
     mkdirSync(dirname(resolvedPath), { recursive: true });
     return resolvedPath;
+  }
+
+  private parseBoolean(rawValue: string | undefined, defaultValue: boolean): boolean {
+    if (rawValue === undefined) {
+      return defaultValue;
+    }
+
+    const normalized = rawValue.trim().toLowerCase();
+
+    if (normalized === 'true' || normalized === '1' || normalized === 'yes' || normalized === 'on') {
+      return true;
+    }
+
+    if (normalized === 'false' || normalized === '0' || normalized === 'no' || normalized === 'off') {
+      return false;
+    }
+
+    return defaultValue;
   }
 
   private writeToFile(message: string, error?: string): void {
