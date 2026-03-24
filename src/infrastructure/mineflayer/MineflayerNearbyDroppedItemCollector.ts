@@ -15,6 +15,9 @@ export class MineflayerNearbyDroppedItemCollector {
   private readonly scanIntervalMs = 750;
   private readonly defaultHorizontalRange = 4;
   private readonly defaultVerticalRange = 2;
+  private readonly pickupAttemptLimit = 4;
+  private readonly pickupStepDistance = 0.5;
+  private readonly pickupGoalRange = 1;
   private collectionPromise: Promise<boolean> | null = null;
   private intervalId: NodeJS.Timeout | null = null;
 
@@ -91,22 +94,94 @@ export class MineflayerNearbyDroppedItemCollector {
         return collectedAny;
       }
 
-      try {
-        await this.gotoPosition(droppedItem.position, 1);
-      } catch (error) {
-        if (!this.hasDroppedItemNearby(center, horizontalRange, verticalRange)) {
-          return collectedAny;
-        }
+      const wasCollected = await this.tryCollectDroppedItem(
+        droppedItem.position,
+        center,
+        horizontalRange,
+        verticalRange,
+      );
 
-        this.logger.warn(
-          `Skipping dropped-item collection attempt near ${droppedItem.position.x.toFixed(1)} ${droppedItem.position.y.toFixed(1)} ${droppedItem.position.z.toFixed(1)}: ${this.stringifyError(error)}`,
-        );
+      if (!wasCollected) {
         return collectedAny;
       }
 
       collectedAny = true;
-      await this.bot.waitForTicks(5);
     }
+  }
+
+  private async tryCollectDroppedItem(
+    droppedItemPosition: Vec3,
+    center: Vec3,
+    horizontalRange: number,
+    verticalRange: number,
+  ): Promise<boolean> {
+    for (let attempt = 1; attempt <= this.pickupAttemptLimit; attempt += 1) {
+      const droppedItem = this.findNearestDroppedItem(center, horizontalRange, verticalRange);
+
+      if (!droppedItem) {
+        return true;
+      }
+
+      const targetPosition =
+        attempt === 1 ? droppedItem.position : this.buildPickupStepTarget(droppedItem.position);
+
+      if (!targetPosition) {
+        return false;
+      }
+
+      try {
+        await this.gotoPosition(
+          targetPosition,
+          attempt === 1 ? this.pickupGoalRange : this.pickupStepDistance,
+        );
+      } catch (error) {
+        if (!this.hasDroppedItemNearby(center, horizontalRange, verticalRange)) {
+          return true;
+        }
+
+        if (attempt === this.pickupAttemptLimit) {
+          this.logger.warn(
+            `Skipping dropped-item collection near ${droppedItem.position.x.toFixed(1)} ${droppedItem.position.y.toFixed(1)} ${droppedItem.position.z.toFixed(1)} after ${this.pickupAttemptLimit} attempts: ${this.stringifyError(error)}`,
+          );
+          return false;
+        }
+
+        continue;
+      }
+
+      await this.bot.waitForTicks(5);
+
+      if (!this.hasDroppedItemNearby(center, horizontalRange, verticalRange)) {
+        return true;
+      }
+    }
+
+    this.logger.warn(
+      `Skipping dropped-item collection near ${droppedItemPosition.x.toFixed(1)} ${droppedItemPosition.y.toFixed(1)} ${droppedItemPosition.z.toFixed(1)} because the item stayed out of reach after ${this.pickupAttemptLimit} attempts.`,
+    );
+    return false;
+  }
+
+  private buildPickupStepTarget(targetPosition: Vec3): Vec3 | null {
+    if (!this.bot.entity) {
+      return null;
+    }
+
+    const currentPosition = this.bot.entity.position;
+    const dx = targetPosition.x - currentPosition.x;
+    const dz = targetPosition.z - currentPosition.z;
+    const horizontalDistance = Math.sqrt(dx * dx + dz * dz);
+
+    if (horizontalDistance < 0.001) {
+      return targetPosition;
+    }
+
+    const stepDistance = Math.min(this.pickupStepDistance, horizontalDistance);
+    return new Vec3(
+      currentPosition.x + (dx / horizontalDistance) * stepDistance,
+      targetPosition.y,
+      currentPosition.z + (dz / horizontalDistance) * stepDistance,
+    );
   }
 
   private findNearestDroppedItem(

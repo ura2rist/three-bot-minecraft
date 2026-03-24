@@ -28,7 +28,10 @@ test('ShelterLayoutService exposes roof and wall geometry for the taller house',
   assert.equal(layout.getWallPositions(rallyPoint).length, 76);
   assert.equal(layout.getRoofPositions(rallyPoint).length, 54);
   assert.deepEqual(layout.getRoofAccessStepPositions(rallyPoint), [
+    { x: 220, y: 64, z: -79 },
+    { x: 221, y: 64, z: -79 },
     { x: 222, y: 64, z: -79 },
+    { x: 220, y: 65, z: -79 },
     { x: 221, y: 65, z: -79 },
     { x: 220, y: 66, z: -79 },
   ]);

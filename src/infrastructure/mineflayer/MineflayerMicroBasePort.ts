@@ -203,14 +203,17 @@ export class MineflayerMicroBasePort implements MicroBasePort {
       return;
     }
 
-    await this.ensureBedsCraftable(rallyPoint, this.minimumShelterBedCount);
+    const requiredInventoryBeds = this.getRequiredShelterInventoryBeds(rallyPoint);
+    await this.ensureBedsCraftable(rallyPoint, requiredInventoryBeds);
     this.logger.info(
       `Collected enough wool for ${this.minimumShelterBedCount} beds. Returning to the rally point for the building phase.`,
     );
     await this.navigateTo(this.toVec3(rallyPoint), 2);
     await this.waitForNearbyCraftingTable(rallyPoint);
 
-    if (!this.isShelterBuilt(rallyPoint)) {
+    const shelterBuilt = this.isShelterBuilt(rallyPoint);
+
+    if (!shelterBuilt) {
       this.logger.info(
         `Gathering wood for the shelter and the remaining bed materials. Target planks: ${this.woodTargetPlanks}.`,
       );
@@ -221,26 +224,35 @@ export class MineflayerMicroBasePort implements MicroBasePort {
 
     const accessibleBedCount = this.countAccessiblePlacedBeds(rallyPoint);
     const missingBeds = Math.max(0, this.minimumShelterBedCount - accessibleBedCount);
+    const bedsToCraft = Math.max(0, requiredInventoryBeds - this.countInventoryBeds());
 
-    if (missingBeds > 0) {
-      const craftedBeds = await this.craftAdditionalBeds(rallyPoint, missingBeds);
+    if (bedsToCraft > 0) {
+      const craftedBeds = await this.craftAdditionalBeds(rallyPoint, bedsToCraft);
 
-      if (craftedBeds < missingBeds) {
+      if (craftedBeds < bedsToCraft) {
         throw this.createMissingThingError('кровати для дома');
       }
 
       this.logger.info(`Crafted ${craftedBeds} bed item(s). Proceeding to the shelter construction phase.`);
+    } else if (missingBeds > 0) {
+      this.logger.info('Enough bed items are already in inventory for the shelter. Skipping additional bed crafting.');
     } else {
       this.logger.info('Enough beds are already placed near the rally point. Skipping bed crafting.');
     }
 
-    if (!this.hasPlacedShelterDoor(rallyPoint)) {
+    const shelterDoorPlaced = this.hasPlacedShelterDoor(rallyPoint);
+
+    if (!shelterDoorPlaced) {
       await this.ensureDoorCrafted(rallyPoint);
     } else {
       this.logger.info('Shelter entrance already has a door. Skipping door crafting.');
     }
 
-    await this.buildShelter(rallyPoint);
+    if (!shelterBuilt || !shelterDoorPlaced) {
+      await this.buildShelter(rallyPoint);
+    } else {
+      this.logger.info('Shelter structure and door already exist near the rally point. Skipping shelter construction.');
+    }
     await this.placeBedsUntilShelterCapacity(rallyPoint);
     await this.sleepUntilSpawnIsSet(rallyPoint);
   }
@@ -618,7 +630,14 @@ export class MineflayerMicroBasePort implements MicroBasePort {
   }
 
   private async placeBed(position: Vec3, rallyPoint: BotRallyPoint): Promise<void> {
+    this.logger.info(
+      `Attempting to place a bed at ${position.x} ${position.y} ${position.z}. ${this.describeBedPlacementState(position, rallyPoint)}`,
+    );
+
     for (let shelterEntryAttempt = 0; shelterEntryAttempt < 2; shelterEntryAttempt += 1) {
+      await this.clearBedPlacementArea(position, rallyPoint);
+      const candidatePlacements = this.getCandidateBedPlacements(position, rallyPoint);
+
       for (const bedName of BED_ITEM_NAMES) {
         const bedItem = this.findInventoryItem(bedName);
 
@@ -626,17 +645,24 @@ export class MineflayerMicroBasePort implements MicroBasePort {
           continue;
         }
 
-        for (const yaw of [0, Math.PI / 2, Math.PI, -Math.PI / 2]) {
+        for (const candidatePlacement of candidatePlacements) {
           try {
             await this.placeBlockFromInventory(
               position,
               bedItem,
               new Set(BED_BLOCK_NAMES),
-              yaw,
+              candidatePlacement.yaw,
               [new Vec3(0, 1, 0)],
+              candidatePlacement.standPosition,
+            );
+            this.logger.info(
+              `Placed ${bedName} at ${position.x} ${position.y} ${position.z} using yaw ${this.describeYaw(candidatePlacement.yaw)} from ${this.describeVec3(candidatePlacement.standPosition)} toward ${this.describeVec3(candidatePlacement.headPosition)}.`,
             );
             return;
-          } catch {
+          } catch (error) {
+            this.logger.warn(
+              `Bed placement attempt failed for ${bedName} at ${position.x} ${position.y} ${position.z} using yaw ${this.describeYaw(candidatePlacement.yaw)} from ${this.describeVec3(candidatePlacement.standPosition)} toward ${this.describeVec3(candidatePlacement.headPosition)}: ${this.stringifyError(error)}. ${this.describeBedPlacementState(position, rallyPoint)}`,
+            );
             continue;
           }
         }
@@ -652,6 +678,9 @@ export class MineflayerMicroBasePort implements MicroBasePort {
       await this.enterShelterThroughDoor(rallyPoint);
     }
 
+    this.logger.warn(
+      `Exhausted all bed placement attempts at ${position.x} ${position.y} ${position.z}. ${this.describeBedPlacementState(position, rallyPoint)}`,
+    );
     throw this.createMissingThingError(`место для кровати в точке ${position.x} ${position.y} ${position.z}`);
   }
 
@@ -660,26 +689,33 @@ export class MineflayerMicroBasePort implements MicroBasePort {
     const occupiedBedPositions = new Set(
       this.getUniquePlacedBedsNearRallyPoint(rallyPoint).map((bed) => this.toBlockKey(bed.position)),
     );
-    const candidatePositions = this.shelterLayout
+    const candidatePlacements = this.shelterLayout
       .getInteriorFloorPositions(rallyPoint)
       .map((position) => this.toBlockVec3(position))
       .filter((position) => !occupiedBedPositions.has(this.toBlockKey(position)))
+      .flatMap((position) =>
+        this.getCandidateBedPlacements(position, rallyPoint).map((placement) => ({
+          footPosition: position,
+          headPosition: placement.headPosition,
+          standPosition: placement.standPosition,
+        })),
+      )
       .sort((left, right) => {
-        const leftDistance = left.distanceSquared(doorPosition);
-        const rightDistance = right.distanceSquared(doorPosition);
+        const leftDistance = left.footPosition.distanceSquared(doorPosition) + left.headPosition.distanceSquared(doorPosition);
+        const rightDistance = right.footPosition.distanceSquared(doorPosition) + right.headPosition.distanceSquared(doorPosition);
 
         if (leftDistance !== rightDistance) {
           return rightDistance - leftDistance;
         }
 
-        if (left.z !== right.z) {
-          return left.z - right.z;
+        if (left.footPosition.z !== right.footPosition.z) {
+          return left.footPosition.z - right.footPosition.z;
         }
 
-        return left.x - right.x;
+        return left.footPosition.x - right.footPosition.x;
       });
 
-    return candidatePositions.find((position) => this.isCandidateBedPlacementPosition(position, rallyPoint)) ?? null;
+    return candidatePlacements[0]?.footPosition ?? null;
   }
 
   private isCandidateBedPlacementPosition(position: Vec3, rallyPoint: BotRallyPoint): boolean {
@@ -697,24 +733,58 @@ export class MineflayerMicroBasePort implements MicroBasePort {
       return false;
     }
 
-    return this.getCardinalOffsets().some((offset) => {
+    return this.getCandidateBedPlacements(position, rallyPoint).length > 0;
+  }
+
+  private getCandidateBedPlacements(
+    position: Vec3,
+    rallyPoint: BotRallyPoint,
+  ): Array<{ headPosition: Vec3; standPosition: Vec3; yaw: number }> {
+    return this.getCardinalOffsets().flatMap((offset) => {
       const headPosition = position.plus(offset);
 
       if (!this.isInsideShelterArea(headPosition, rallyPoint)) {
-        return false;
+        return [];
       }
 
       const headFloorBlock = this.bot.blockAt(headPosition.offset(0, -1, 0));
 
       if (!headFloorBlock || headFloorBlock.boundingBox !== 'block') {
-        return false;
+        return [];
       }
 
-      return (
-        this.isPassableShelterSpaceBlock(this.bot.blockAt(headPosition)) &&
-        this.isPassableShelterSpaceBlock(this.bot.blockAt(headPosition.offset(0, 1, 0)))
-      );
+      if (
+        !this.isPassableShelterSpaceBlock(this.bot.blockAt(headPosition)) ||
+        !this.isPassableShelterSpaceBlock(this.bot.blockAt(headPosition.offset(0, 1, 0)))
+      ) {
+        return [];
+      }
+
+      const standPosition = position.minus(offset);
+
+      if (!this.isInsideShelterArea(standPosition, rallyPoint)) {
+        return [];
+      }
+
+      if (!this.isPassableStandPosition(this.toBlockPosition(standPosition))) {
+        return [];
+      }
+
+      return [{
+        headPosition,
+        standPosition,
+        yaw: this.getBedPlacementYaw(offset),
+      }];
     });
+  }
+
+  private async clearBedPlacementArea(position: Vec3, rallyPoint: BotRallyPoint): Promise<void> {
+    await this.requestFriendlyBotsToClearPosition(position, 2);
+
+    for (const candidatePlacement of this.getCandidateBedPlacements(position, rallyPoint)) {
+      await this.requestFriendlyBotsToClearPosition(candidatePlacement.headPosition, 2);
+      await this.requestFriendlyBotsToClearPosition(candidatePlacement.standPosition, 2);
+    }
   }
 
   private async placeDoor(position: Vec3, rallyPoint: BotRallyPoint): Promise<void> {
@@ -758,6 +828,7 @@ export class MineflayerMicroBasePort implements MicroBasePort {
     allowedExistingBlockNames: ReadonlySet<string>,
     yaw?: number,
     preferredFaceVectors?: ReadonlyArray<Vec3>,
+    preferredStandPosition?: Vec3,
   ): Promise<void> {
     for (let attempt = 1; attempt <= this.blockPlacementAttempts; attempt += 1) {
       this.ensureScenarioActive();
@@ -790,10 +861,10 @@ export class MineflayerMicroBasePort implements MicroBasePort {
 
       for (const placement of placements) {
         try {
-          await this.navigateToPlacementPosition(position, placement.faceVector);
+          await this.navigateToPlacementPosition(position, placement.faceVector, preferredStandPosition);
 
           if (yaw !== undefined) {
-            await this.bot.look(yaw, 0, true);
+            await this.lookAtPlacementPosition(position, yaw);
           } else {
             await this.bot.lookAt(position.offset(0.5, 0.5, 0.5), true);
           }
@@ -845,7 +916,7 @@ export class MineflayerMicroBasePort implements MicroBasePort {
 
       if (attempt < this.blockPlacementAttempts && retryRequested) {
         this.logger.warn(
-          `Block placement at ${position.x} ${position.y} ${position.z} was not confirmed yet: ${this.stringifyError(lastPlacementError)}. Retrying.`,
+          `Block placement of ${item.name} at ${position.x} ${position.y} ${position.z}${yaw !== undefined ? ` with yaw ${this.describeYaw(yaw)}` : ''} was not confirmed yet: ${this.stringifyError(lastPlacementError)}. Retrying.`,
         );
         await this.bot.waitForTicks(10);
         continue;
@@ -933,7 +1004,16 @@ export class MineflayerMicroBasePort implements MicroBasePort {
     );
   }
 
-  private async navigateToPlacementPosition(position: Vec3, faceVector: Vec3): Promise<void> {
+  private async navigateToPlacementPosition(
+    position: Vec3,
+    faceVector: Vec3,
+    preferredStandPosition?: Vec3,
+  ): Promise<void> {
+    if (preferredStandPosition) {
+      await this.navigateTo(preferredStandPosition, 0.75);
+      return;
+    }
+
     const placementGoal = new GoalPlaceBlock(position, this.bot.world, {
       range: this.blockPlacementRange,
       faces: [faceVector.scaled(-1)],
@@ -973,6 +1053,63 @@ export class MineflayerMicroBasePort implements MicroBasePort {
     }
 
     return block.name;
+  }
+
+  private async lookAtPlacementPosition(position: Vec3, yaw: number): Promise<void> {
+    await this.bot.lookAt(position.offset(0.5, 0.5, 0.5), true);
+    const pitch = this.bot.entity?.pitch ?? 0;
+    await this.bot.look(yaw, pitch, true);
+  }
+
+  private describeBedPlacementState(position: Vec3, rallyPoint: BotRallyPoint): string {
+    const candidateHeads = this.getCardinalOffsets().map((offset) => {
+      const headPosition = position.plus(offset);
+
+      return `${this.describeVec3(headPosition)} inside=${this.isInsideShelterArea(headPosition, rallyPoint)} floor=${this.describeBlockAtPosition(headPosition.offset(0, -1, 0))} foot=${this.describeBlockAtPosition(headPosition)} head=${this.describeBlockAtPosition(headPosition.offset(0, 1, 0))}`;
+    });
+    const botPosition = this.bot.entity ? this.describeVec3(this.bot.entity.position) : 'missing';
+
+    return `Bot=${botPosition}; targetFloor=${this.describeBlockAtPosition(position.offset(0, -1, 0))}; targetFoot=${this.describeBlockAtPosition(position)}; targetHead=${this.describeBlockAtPosition(position.offset(0, 1, 0))}; inventoryBeds=${this.countInventoryBeds()}; candidateHeads=[${candidateHeads.join('; ')}]`;
+  }
+
+  private describeYaw(yaw: number): string {
+    if (yaw === 0) {
+      return 'south(0)';
+    }
+
+    if (yaw === Math.PI / 2) {
+      return 'west(pi/2)';
+    }
+
+    if (yaw === Math.PI) {
+      return 'north(pi)';
+    }
+
+    if (yaw === -Math.PI / 2) {
+      return 'east(-pi/2)';
+    }
+
+    return String(yaw);
+  }
+
+  private getBedPlacementYaw(headOffset: Vec3): number {
+    if (headOffset.x === 1) {
+      return -Math.PI / 2;
+    }
+
+    if (headOffset.x === -1) {
+      return Math.PI / 2;
+    }
+
+    if (headOffset.z === 1) {
+      return 0;
+    }
+
+    return Math.PI;
+  }
+
+  private describeVec3(position: Vec3): string {
+    return `${position.x.toFixed(2)} ${position.y.toFixed(2)} ${position.z.toFixed(2)}`;
   }
 
   private mayClearBlockingBuildBlock(blockName: string): boolean {
@@ -1156,24 +1293,30 @@ export class MineflayerMicroBasePort implements MicroBasePort {
       return;
     }
 
-    const missingBeds = Math.max(1, this.minimumShelterBedCount - accessibleBeds);
+    const requiredInventoryBeds = this.getRequiredShelterInventoryBeds(rallyPoint);
+    const currentInventoryBeds = this.countInventoryBeds();
+    const bedsToCraft = Math.max(0, requiredInventoryBeds - currentInventoryBeds);
 
-    this.logger.info(
-      `Shelter had only ${accessibleBeds}/${this.minimumShelterBedCount} accessible beds overnight. Gathering sheep and wood for ${missingBeds} additional bed(s).`,
-    );
-    await this.waitForNearbyCraftingTable(rallyPoint);
-    await this.ensureBedsCraftable(rallyPoint, missingBeds);
-    await this.ensurePlanksAvailable(3 * missingBeds);
+    if (bedsToCraft > 0) {
+      this.logger.info(
+        `Shelter had only ${accessibleBeds}/${this.minimumShelterBedCount} accessible beds overnight. Gathering sheep and wood for ${bedsToCraft} additional bed(s).`,
+      );
+      await this.waitForNearbyCraftingTable(rallyPoint);
+      await this.ensureBedsCraftable(rallyPoint, currentInventoryBeds + bedsToCraft);
+      await this.ensurePlanksAvailable(3 * bedsToCraft);
 
-    const craftedBeds = await this.craftAdditionalBeds(rallyPoint, missingBeds);
+      const craftedBeds = await this.craftAdditionalBeds(rallyPoint, bedsToCraft);
 
-    if (craftedBeds < missingBeds) {
-      throw this.createMissingThingError('РєСЂРѕРІР°С‚Рё РґР»СЏ СЂР°СЃС€РёСЂРµРЅРёСЏ РґРѕРјР°');
+      if (craftedBeds < bedsToCraft) {
+        throw this.createMissingThingError('кровати для расширения дома');
+      }
+
+      this.logger.info(
+        `Crafted ${craftedBeds} additional bed item(s) after a missed night. Expanding the shelter sleeping capacity.`,
+      );
+    } else {
+      this.logger.info('The missing shelter beds are already in inventory. Expanding the sleeping capacity without crafting more beds.');
     }
-
-    this.logger.info(
-      `Crafted ${craftedBeds} additional bed item(s) after a missed night. Expanding the shelter sleeping capacity.`,
-    );
     await this.placeBedsUntilShelterCapacity(rallyPoint);
     await this.sleepUntilSpawnIsSet(rallyPoint);
   }
@@ -1558,6 +1701,10 @@ export class MineflayerMicroBasePort implements MicroBasePort {
       .items()
       .filter((item) => BED_ITEM_NAMES.includes(item.name))
       .reduce((total, item) => total + item.count, 0);
+  }
+
+  private getRequiredShelterInventoryBeds(rallyPoint: BotRallyPoint): number {
+    return Math.max(0, this.minimumShelterBedCount - this.countAccessiblePlacedBeds(rallyPoint));
   }
 
   private countInventoryLogs(): number {

@@ -121,28 +121,55 @@ export class ShelterLayoutService {
 
   getRoofAccessStepPositions(rallyPoint: BotRallyPoint): BlockPosition[] {
     const origin = this.getOrigin(rallyPoint);
+    const accessZ = origin.z + this.dimensions.roofAccessStepZ;
+    const wallSideX = origin.x + this.dimensions.width;
+    const middleX = wallSideX + 1;
+    const outerX = wallSideX + 2;
 
+    // Build the ramp from the wall outward so every block has a solid neighbour
+    // even on completely flat terrain without relying on diagonal support.
     return [
       {
-        x: origin.x + this.dimensions.width + 2,
+        x: wallSideX,
         y: origin.y,
-        z: origin.z + this.dimensions.roofAccessStepZ,
+        z: accessZ,
       },
       {
-        x: origin.x + this.dimensions.width + 1,
+        x: middleX,
+        y: origin.y,
+        z: accessZ,
+      },
+      {
+        x: outerX,
+        y: origin.y,
+        z: accessZ,
+      },
+      {
+        x: wallSideX,
         y: origin.y + 1,
-        z: origin.z + this.dimensions.roofAccessStepZ,
+        z: accessZ,
       },
       {
-        x: origin.x + this.dimensions.width,
+        x: middleX,
+        y: origin.y + 1,
+        z: accessZ,
+      },
+      {
+        x: wallSideX,
         y: origin.y + 2,
-        z: origin.z + this.dimensions.roofAccessStepZ,
+        z: accessZ,
       },
     ];
   }
 
   getRoofAccessStandingPosition(rallyPoint: BotRallyPoint): BlockPosition {
-    const topStep = this.getRoofAccessStepPositions(rallyPoint)[2];
+    const origin = this.getOrigin(rallyPoint);
+    const accessZ = origin.z + this.dimensions.roofAccessStepZ;
+    const topStep = {
+      x: origin.x + this.dimensions.width,
+      y: origin.y + 2,
+      z: accessZ,
+    };
 
     return {
       x: topStep.x,

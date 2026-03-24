@@ -198,12 +198,39 @@ export class MineflayerLogHarvestingPort implements LogHarvestingPort {
     await this.bot.waitForTicks(5);
 
     while (Date.now() < deadline) {
+      const hasDroppedItemsBeforeAttempt = this.nearbyDroppedItemCollector.hasDroppedItemNearby(
+        dropPosition,
+        this.pickupHorizontalRange,
+        this.pickupVerticalRange,
+      );
+
       try {
-        await this.nearbyDroppedItemCollector.collectAround(
+        const collectedAny = await this.nearbyDroppedItemCollector.collectAround(
           dropPosition,
           this.pickupHorizontalRange,
           this.pickupVerticalRange,
         );
+
+        if (this.countInventoryLogs() > logsBeforeDig) {
+          return true;
+        }
+
+        const hasDroppedItemsAfterAttempt = this.nearbyDroppedItemCollector.hasDroppedItemNearby(
+          dropPosition,
+          this.pickupHorizontalRange,
+          this.pickupVerticalRange,
+        );
+
+        if (!hasDroppedItemsAfterAttempt) {
+          return false;
+        }
+
+        if (hasDroppedItemsBeforeAttempt || collectedAny) {
+          this.logger.warn(
+            `Dropped items near ${dropPosition.x} ${dropPosition.y} ${dropPosition.z} stayed out of reach after several pickup attempts. Continuing with the next resource target.`,
+          );
+          return false;
+        }
       } catch (error) {
         if (
           !this.nearbyDroppedItemCollector.hasDroppedItemNearby(
@@ -221,10 +248,17 @@ export class MineflayerLogHarvestingPort implements LogHarvestingPort {
         this.logger.warn(
           `Could not collect dropped items near ${dropPosition.x} ${dropPosition.y} ${dropPosition.z}: ${this.stringifyError(error)}.`,
         );
-      }
 
-      if (this.countInventoryLogs() > logsBeforeDig) {
-        return true;
+        if (
+          hasDroppedItemsBeforeAttempt &&
+          this.nearbyDroppedItemCollector.hasDroppedItemNearby(
+            dropPosition,
+            this.pickupHorizontalRange,
+            this.pickupVerticalRange,
+          )
+        ) {
+          return false;
+        }
       }
 
       if (
