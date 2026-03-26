@@ -84,6 +84,45 @@ test('EnsureCraftingTableNearRallyPointService gathers logs when nothing can be 
   assert.equal(gatherCalls, 1);
 });
 
+test('EnsureCraftingTableNearRallyPointService rechecks for an existing crafting table before gathering logs as the assigned crafter', async () => {
+  let hasCraftingTableChecks = 0;
+  let gatherCalls = 0;
+  const service = new EnsureCraftingTableNearRallyPointService(
+    {
+      prepareFleet: () => undefined,
+      getAssignedUsername: () => 'Gimli',
+      isAssignedCrafter: () => true,
+    },
+    {
+      hasCraftingTableNearRallyPoint: async () => {
+        hasCraftingTableChecks += 1;
+        return hasCraftingTableChecks >= 3;
+      },
+      placeCraftingTableNearRallyPoint: async () => {
+        throw new Error('should not place');
+      },
+    },
+    {
+      hasItem: async () => false,
+      craftCraftingTable: async () => false,
+      craftPlanksFromInventoryLogs: async () => false,
+    },
+    {
+      gatherNearestLog: async () => {
+        gatherCalls += 1;
+      },
+    },
+    new TestLogger(),
+  );
+
+  (service as unknown as { craftingTableDiscoveryGraceTimeoutMs: number }).craftingTableDiscoveryGraceTimeoutMs = 50;
+  (service as unknown as { craftingTableDiscoveryGracePollIntervalMs: number }).craftingTableDiscoveryGracePollIntervalMs = 1;
+
+  await service.execute(configuration);
+  assert.ok(hasCraftingTableChecks >= 3);
+  assert.equal(gatherCalls, 0);
+});
+
 test('EnsureCraftingTableNearRallyPointService exits early when the crafting table already exists', async () => {
   let placementCalls = 0;
   const service = new EnsureCraftingTableNearRallyPointService(
