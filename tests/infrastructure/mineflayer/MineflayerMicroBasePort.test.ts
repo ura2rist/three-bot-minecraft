@@ -228,8 +228,11 @@ test('MineflayerMicroBasePort retries entering the shelter when another bot clos
 test('MineflayerMicroBasePort schedules a delayed shelter-door close after entry', async () => {
   const port = createPort([]) as any;
   let closeDoorCalls = 0;
+  const waitedTicks: number[] = [];
 
-  port.bot.waitForTicks = async () => undefined;
+  port.bot.waitForTicks = async (ticks: number) => {
+    waitedTicks.push(ticks);
+  };
   port.isBotInsideShelter = () => true;
   port.getShelterDoorPosition = () => new Vec3(215, 64, -80);
   port.isShelterDoorOpen = () => true;
@@ -240,5 +243,23 @@ test('MineflayerMicroBasePort schedules a delayed shelter-door close after entry
   port.scheduleShelterDoorClose(rallyPoint);
   await new Promise((resolve) => setTimeout(resolve, 0));
 
+  assert.deepEqual(waitedTicks, [300]);
   assert.equal(closeDoorCalls, 1);
+});
+
+test('MineflayerMicroBasePort does not interact with a bed through a wall', async () => {
+  const port = createPort([]) as any;
+  const bed = {
+    position: new Vec3(213, 64, -79),
+  };
+
+  port.bot.entity = { position: new Vec3(213, 64, -77), height: 1.62 };
+  port.bot.world = {
+    raycast: () => ({ position: new Vec3(213, 64, -78) }),
+  };
+
+  assert.throws(
+    () => port.ensureBlockIsInDirectLineOfSight(bed, 'touch a bed to set the spawn point'),
+    /direct line of sight/i,
+  );
 });

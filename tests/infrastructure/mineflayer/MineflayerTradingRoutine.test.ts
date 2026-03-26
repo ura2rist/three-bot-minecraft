@@ -102,11 +102,11 @@ test('MineflayerTradingRoutine performs cleanup and restock when inventory maint
 
 test('MineflayerTradingRoutine tries to leave the shelter before opening storage chests', async () => {
   const inventoryItems = [{ name: 'white_wool', count: 0, type: 35 }];
-  const { routine } = createRoutine(inventoryItems);
+  const { routine, bot } = createRoutine(inventoryItems);
   let exitCalls = 0;
   let restockCalls = 0;
 
-  routine.isBotInsideShelter = () => true;
+  bot.entity.position = new Vec3(215, 64, -75);
   routine.exitShelterThroughDoor = async () => {
     exitCalls += 1;
     return true;
@@ -129,10 +129,10 @@ test('MineflayerTradingRoutine tries to leave the shelter before opening storage
 
 test('MineflayerTradingRoutine skips chest interaction when it cannot leave the shelter yet', async () => {
   const inventoryItems = [{ name: 'white_wool', count: 0, type: 35 }];
-  const { routine } = createRoutine(inventoryItems);
+  const { routine, bot } = createRoutine(inventoryItems);
   let restockCalls = 0;
 
-  routine.isBotInsideShelter = () => true;
+  bot.entity.position = new Vec3(215, 64, -75);
   routine.exitShelterThroughDoor = async () => false;
   routine.chestInventoryManager = {
     getFreeInventorySlots: () => 8,
@@ -147,6 +147,48 @@ test('MineflayerTradingRoutine skips chest interaction when it cannot leave the 
 
   assert.equal(maintained, false);
   assert.equal(restockCalls, 0);
+});
+
+test('MineflayerTradingRoutine treats the shelter doorway as needing an exit before storage access', async () => {
+  const inventoryItems = [{ name: 'white_wool', count: 0, type: 35 }];
+  const { routine, bot } = createRoutine(inventoryItems);
+  let exitCalls = 0;
+
+  bot.entity.position = new Vec3(215, 64, -75);
+  routine.exitShelterThroughDoor = async () => {
+    exitCalls += 1;
+    return true;
+  };
+
+  const exited = await routine.ensureOutsideShelter();
+
+  assert.equal(exited, true);
+  assert.equal(exitCalls, 1);
+});
+
+test('MineflayerTradingRoutine exits through the outside tile directly in front of the shelter door', async () => {
+  const inventoryItems = [{ name: 'white_wool', count: 0, type: 35 }];
+  const { routine, bot } = createRoutine(inventoryItems);
+  const gotoTargets: Vec3[] = [];
+
+  bot.entity.position = new Vec3(215, 64, -76);
+  routine.gotoPosition = async (target: Vec3) => {
+    gotoTargets.push(target.clone());
+
+    if (target.x === 215 && target.y === 64 && target.z === -74) {
+      bot.entity.position = new Vec3(215, 64, -74);
+    }
+  };
+  routine.openShelterDoorIfNeeded = async () => undefined;
+  routine.stepTowards = async () => undefined;
+
+  const exited = await routine.exitShelterThroughDoor();
+
+  assert.equal(exited, true);
+  assert.equal(
+    gotoTargets.some((target) => target.x === 215 && target.y === 64 && target.z === -74),
+    true,
+  );
 });
 
 test('MineflayerTradingRoutine does not immediately recheck chests while a depleted trade item still remains in inventory', async () => {

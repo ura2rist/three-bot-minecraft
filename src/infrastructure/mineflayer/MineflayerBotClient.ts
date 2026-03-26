@@ -7,13 +7,14 @@ import { BotThreatPrioritySubscriber } from '../../application/bot/subscribers/B
 import { BotPriorityCoordinator } from '../../application/bot/services/BotPriorityCoordinator';
 import { SquadWeaponReadinessTracker } from '../../application/bot/services/SquadWeaponReadinessTracker';
 import { BotClient } from '../../application/bot/ports/BotClient';
+import { FarmRoleSettingsProvider } from '../../application/bot/ports/FarmRoleSettingsProvider';
 import { TradingRoleSettingsProvider } from '../../application/bot/ports/TradingRoleSettingsProvider';
 import { EstablishMicroBaseService } from '../../application/bot/services/EstablishMicroBaseService';
 import { DeterministicMicroBaseAssignmentPolicy } from '../../application/bot/services/DeterministicMicroBaseAssignmentPolicy';
 import { EnsureCraftingTableNearRallyPointService } from '../../application/bot/services/EnsureCraftingTableNearRallyPointService';
 import { RandomCraftingTableAssignmentPolicy } from '../../application/bot/services/RandomCraftingTableAssignmentPolicy';
 import { BotConfiguration } from '../../domain/bot/entities/BotConfiguration';
-import { TradingRoleSettings } from '../../domain/bot/entities/RoleSettings';
+import { FarmRoleSettings, TradingRoleSettings } from '../../domain/bot/entities/RoleSettings';
 import { Logger } from '../../application/shared/ports/Logger';
 import { LightAuthBotAuthenticator } from './LightAuthBotAuthenticator';
 import { MineflayerAutoEatController } from './MineflayerAutoEatController';
@@ -24,6 +25,7 @@ import { MicroBaseScenarioCancelledError, MineflayerMicroBasePort } from './Mine
 import { MineflayerNearbyDroppedItemCollector } from './MineflayerNearbyDroppedItemCollector';
 import { MineflayerLogHarvestingPort } from './MineflayerLogHarvestingPort';
 import { MineflayerSquadDefenseController } from './MineflayerSquadDefenseController';
+import { MineflayerFarmRoutine } from './MineflayerFarmRoutine';
 import { MineflayerTradingRoutine } from './MineflayerTradingRoutine';
 import type { BotWithPathfinder, PathfinderApi, PathfinderMovements } from './MineflayerPortsShared';
 import { InMemoryEventBus } from '../events/InMemoryEventBus';
@@ -109,12 +111,15 @@ export class MineflayerBotClient implements BotClient {
   private readonly friendlyUsernames = new Set<string>();
   private readonly connectedPathfinderBots = new Map<string, BotWithClient>();
   private readonly tradingRoleSettings: TradingRoleSettings;
+  private readonly farmRoleSettings: FarmRoleSettings;
 
   constructor(
     private readonly logger: Logger,
     tradingRoleSettingsProvider: TradingRoleSettingsProvider,
+    farmRoleSettingsProvider: FarmRoleSettingsProvider,
   ) {
     this.tradingRoleSettings = tradingRoleSettingsProvider.load();
+    this.farmRoleSettings = farmRoleSettingsProvider.load();
   }
 
   prepareFleet(configurations: readonly BotConfiguration[]): void {
@@ -214,6 +219,8 @@ export class MineflayerBotClient implements BotClient {
     let microBaseScenarioGeneration = 0;
     let nightlyShelterRoutineStarted = false;
     let tradingRoutineStarted = false;
+    let farmRoutineStarted = false;
+    let farmThreatAvoidanceMode = false;
     let spawnCount = 0;
     let configurationSettingsSent = false;
     let configurationFallbackTriggered = false;
@@ -268,6 +275,8 @@ export class MineflayerBotClient implements BotClient {
       microBaseScenarioStarted = false;
       nightlyShelterRoutineStarted = false;
       tradingRoutineStarted = false;
+      farmRoutineStarted = false;
+      farmThreatAvoidanceMode = false;
       bot.pathfinder?.stop();
       logger.info(`Stopped active scenarios: ${reason}.`);
     };
@@ -317,7 +326,9 @@ export class MineflayerBotClient implements BotClient {
         this.friendlyUsernames,
         (target, range) => this.gotoPosition(pathfinderBot, target, range),
         sharedCombatService,
-        () => priorityCoordinator.canInterruptWithThreatResponse(),
+        () =>
+          !(configuration.role === 'farm' && farmThreatAvoidanceMode) &&
+          priorityCoordinator.canInterruptWithThreatResponse(),
         publishEvent,
       );
       return squadDefenseController;
@@ -459,6 +470,52 @@ export class MineflayerBotClient implements BotClient {
           }
         });
     };
+    const startFarmRoutine = (scenarioGeneration: number) => {
+      if (configuration.role !== 'farm' || !configuration.rallyPoint || farmRoutineStarted) {
+        return;
+      }
+
+      farmRoutineStarted = true;
+      farmThreatAvoidanceMode = true;
+      const farmLogger = logger.child('farm-main');
+      const pathfinderBot = this.requirePathfinderBot(bot);
+      const farmRoutine = new MineflayerFarmRoutine(
+        pathfinderBot,
+        farmLogger,
+        configuration.rallyPoint,
+        this.farmRoleSettings,
+        (target, range) => this.gotoPosition(pathfinderBot, target, range),
+        new MineflayerLogHarvestingPort(
+          pathfinderBot,
+          farmLogger,
+          (target, range) => this.gotoPosition(pathfinderBot, target, range),
+          getNearbyDroppedItemCollector(),
+          createScenarioWaiter(scenarioGeneration),
+          () => false,
+        ),
+        getNearbyDroppedItemCollector(),
+        () => scenarioGeneration === microBaseScenarioGeneration,
+        createScenarioWaiter(scenarioGeneration),
+      );
+
+      void farmRoutine
+        .maintain()
+        .catch((error) => {
+          if (scenarioGeneration !== microBaseScenarioGeneration) {
+            return;
+          }
+
+          farmLogger.warn(
+            `Farm main routine stopped unexpectedly: ${this.stringifyError(error)}.`,
+          );
+        })
+        .finally(() => {
+          if (scenarioGeneration === microBaseScenarioGeneration) {
+            farmRoutineStarted = false;
+            farmThreatAvoidanceMode = false;
+          }
+        });
+    };
     const startMicroBaseScenario = () => {
       if (!configuration.rallyPoint || microBaseScenarioStarted) {
         return;
@@ -490,6 +547,7 @@ export class MineflayerBotClient implements BotClient {
 
           startNightlyShelterRoutine(scenarioGeneration, microBaseLogger);
           startTradingRoutine(scenarioGeneration, microBaseLogger);
+          startFarmRoutine(scenarioGeneration);
         })
         .catch(async (error) => {
           if (error instanceof MicroBaseScenarioCancelledError) {
@@ -507,6 +565,8 @@ export class MineflayerBotClient implements BotClient {
             microBaseScenarioStarted = false;
             nightlyShelterRoutineStarted = false;
             tradingRoutineStarted = false;
+            farmRoutineStarted = false;
+            farmThreatAvoidanceMode = false;
             await priorityCoordinator.waitUntilTaskMayProceed(
               () => scenarioGeneration === microBaseScenarioGeneration,
             );

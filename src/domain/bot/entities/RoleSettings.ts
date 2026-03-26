@@ -1,10 +1,16 @@
-export interface FarmProductSettings {
+export interface FarmPointSettings {
+  x: number;
+  y: number;
+  z: number;
+}
+
+export interface FarmPlotSettings {
   itemId: string;
-  slotCount: number;
+  points: FarmPointSettings[];
 }
 
 export interface FarmRoleSettings {
-  products: FarmProductSettings[];
+  farms: FarmPlotSettings[];
 }
 
 export interface MineShaftSettings {

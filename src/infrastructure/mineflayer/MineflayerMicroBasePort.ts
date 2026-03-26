@@ -108,11 +108,12 @@ export class MineflayerMicroBasePort implements MicroBasePort {
   private readonly woodenSwordCraftAttempts = 4;
   private readonly maxConsecutivePlankGatherStalls = 6;
   private readonly buildingMaterialRestockPlanks = 12;
-  private readonly shelterDoorCloseDelayTicks = 200;
+  private readonly shelterDoorCloseDelayTicks = 300;
   private readonly shelterDoorEntryAttempts = 3;
   private readonly roofAccessStepZ = 1;
   private readonly nightShelterCheckIntervalTicks = 20;
   private readonly shelterDoorSearchRadius = 8;
+  private readonly directInteractionPadding = 0.5;
   private readonly shelterLayout: ShelterLayoutService;
   private readonly bedAssignmentService = new BedAssignmentService();
   private readonly nightlyShelterSleepDecisionService = new NightlyShelterSleepDecisionService();
@@ -1197,6 +1198,7 @@ export class MineflayerMicroBasePort implements MicroBasePort {
           await this.moveInsideShelter(rallyPoint, true);
           await this.ensureShelterDoorClosedBeforeSleeping(rallyPoint);
           await this.navigateTo(bed.position, 2);
+          this.ensureBlockIsInDirectLineOfSight(bed, 'sleep in a nearby bed');
           await this.bot.sleep(bed);
           this.logger.info(
             `Sleeping in a bed at ${bed.position.x} ${bed.position.y} ${bed.position.z} to set the spawn point.`,
@@ -1252,6 +1254,7 @@ export class MineflayerMicroBasePort implements MicroBasePort {
         try {
           await this.ensureShelterDoorClosedBeforeSleeping(rallyPoint);
           await this.navigateTo(bed.position, 2);
+          this.ensureBlockIsInDirectLineOfSight(bed, 'sleep in a shelter bed');
           await this.bot.sleep(bed);
           this.logger.info(
             `Sleeping in a shelter bed at ${bed.position.x} ${bed.position.y} ${bed.position.z} for the night.`,
@@ -1343,6 +1346,7 @@ export class MineflayerMicroBasePort implements MicroBasePort {
   }
 
   private async touchBedToSetSpawnPoint(bed: Block): Promise<void> {
+    this.ensureBlockIsInDirectLineOfSight(bed, 'touch a bed to set the spawn point');
     await this.bot.lookAt(bed.position.offset(0.5, 0.5, 0.5), true).catch(() => undefined);
     await this.bot.activateBlock(bed);
     await this.bot.waitForTicks(10);
@@ -2118,6 +2122,55 @@ export class MineflayerMicroBasePort implements MicroBasePort {
       y: Math.floor(position.y),
       z: Math.floor(position.z),
     };
+  }
+
+  private ensureBlockIsInDirectLineOfSight(block: Block, action: string): void {
+    if (this.hasDirectInteractionLineOfSight(block)) {
+      return;
+    }
+
+    throw new Error(
+      `Could not ${action} at ${block.position.x} ${block.position.y} ${block.position.z}: it is not in direct line of sight.`,
+    );
+  }
+
+  private hasDirectInteractionLineOfSight(targetBlock: Block): boolean {
+    if (!this.bot.entity) {
+      return false;
+    }
+
+    const world = this.bot.world as {
+      raycast?: (origin: Vec3, direction: Vec3, range: number) => { position?: Vec3 } | null;
+    };
+
+    if (typeof world.raycast !== 'function') {
+      return true;
+    }
+
+    const eyeHeight = typeof this.bot.entity.height === 'number' ? this.bot.entity.height : 1.62;
+    const eyePosition = this.bot.entity.position.offset(0, eyeHeight, 0);
+    const targetPoints = [
+      targetBlock.position.offset(0.5, 0.5, 0.5),
+      targetBlock.position.offset(0.5, 0.25, 0.5),
+      targetBlock.position.offset(0.5, 0.75, 0.5),
+    ];
+
+    return targetPoints.some((targetPoint) => {
+      const direction = targetPoint.minus(eyePosition);
+      const distance = direction.norm();
+
+      if (distance <= 0) {
+        return true;
+      }
+
+      const hit = world.raycast?.(
+        eyePosition,
+        direction.scaled(1 / distance),
+        distance + this.directInteractionPadding,
+      );
+
+      return !!hit?.position && hit.position.equals(targetBlock.position);
+    });
   }
 
   private stringifyError(error: unknown): string {

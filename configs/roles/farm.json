@@ -1,12 +1,17 @@
 {
-  "products": [
+  "farms": [
     {
-      "itemId": "wheat",
-      "slotCount": 6
+      "itemId": "wheat_seeds",
+      "points": [
+        { "x": 199.515, "y": 63, "z": -97.373 },
+        { "x": 194.700, "y": 63, "z": -74.300 }
+      ]
     },
     {
       "itemId": "carrot",
-      "slotCount": 3
+      "points": [
+        { "x": 221.700, "y": 64, "z": -89.300 }
+      ]
     }
   ]
 }

@@ -18,6 +18,7 @@ export interface ChestRestockRequest {
 
 export class MineflayerChestInventoryManager {
   private readonly chestSearchRadius = 12;
+  private readonly directInteractionPadding = 0.5;
 
   constructor(
     private readonly bot: BotWithPathfinder,
@@ -184,6 +185,14 @@ export class MineflayerChestInventoryManager {
   private async openChest(chestBlock: Block): Promise<ChestWindow | null> {
     try {
       await this.gotoPosition(chestBlock.position, 2);
+
+      if (!this.hasDirectInteractionLineOfSight(chestBlock)) {
+        this.logger.warn(
+          `Could not open a chest at ${chestBlock.position.x} ${chestBlock.position.y} ${chestBlock.position.z}: it is not in direct line of sight.`,
+        );
+        return null;
+      }
+
       return (await this.bot.openChest(chestBlock)) as unknown as ChestWindow;
     } catch (error) {
       this.logger.warn(
@@ -199,5 +208,44 @@ export class MineflayerChestInventoryManager {
     }
 
     return String(error);
+  }
+
+  private hasDirectInteractionLineOfSight(targetBlock: Block): boolean {
+    if (!this.bot.entity) {
+      return false;
+    }
+
+    const world = this.bot.world as {
+      raycast?: (origin: Vec3, direction: Vec3, range: number) => { position?: Vec3 } | null;
+    };
+
+    if (typeof world.raycast !== 'function') {
+      return true;
+    }
+
+    const eyeHeight = typeof this.bot.entity.height === 'number' ? this.bot.entity.height : 1.62;
+    const eyePosition = this.bot.entity.position.offset(0, eyeHeight, 0);
+    const targetPoints = [
+      targetBlock.position.offset(0.5, 0.5, 0.5),
+      targetBlock.position.offset(0.5, 0.25, 0.5),
+      targetBlock.position.offset(0.5, 0.75, 0.5),
+    ];
+
+    return targetPoints.some((targetPoint) => {
+      const direction = targetPoint.minus(eyePosition);
+      const distance = direction.norm();
+
+      if (distance <= 0) {
+        return true;
+      }
+
+      const hit = world.raycast?.(
+        eyePosition,
+        direction.scaled(1 / distance),
+        distance + this.directInteractionPadding,
+      );
+
+      return !!hit?.position && hit.position.equals(targetBlock.position);
+    });
   }
 }

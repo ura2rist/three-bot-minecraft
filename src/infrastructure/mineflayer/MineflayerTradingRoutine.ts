@@ -351,7 +351,7 @@ export class MineflayerTradingRoutine {
   }
 
   private async ensureOutsideShelter(): Promise<boolean> {
-    if (!this.isBotInsideShelter()) {
+    if (!this.isBotWithinShelterBounds()) {
       return true;
     }
 
@@ -373,9 +373,7 @@ export class MineflayerTradingRoutine {
 
     const doorPosition = doorBlock.position;
     const interiorAnchor = this.getShelterInteriorAnchor(doorPosition);
-    const outsideApproach = this.getDoorApproachPositions(doorPosition)
-      .find((position) => !this.isInsideShelterArea(position)) ??
-      doorPosition;
+    const outsideApproach = this.getOutsideDoorApproachPosition(doorPosition, interiorAnchor);
 
     for (let attempt = 1; attempt <= this.shelterDoorEntryAttempts; attempt += 1) {
       if (interiorAnchor) {
@@ -463,6 +461,17 @@ export class MineflayerTradingRoutine {
       .find((position) => this.isInsideShelterArea(position)) ?? null;
   }
 
+  private getOutsideDoorApproachPosition(doorPosition: Vec3, interiorAnchor: Vec3 | null): Vec3 {
+    if (interiorAnchor) {
+      const outwardOffset = doorPosition.minus(interiorAnchor);
+      return doorPosition.plus(outwardOffset);
+    }
+
+    return this.getDoorApproachPositions(doorPosition)
+      .find((position) => !this.isInsideShelterArea(position)) ??
+      doorPosition;
+  }
+
   private getDoorApproachPositions(doorPosition: Vec3): Vec3[] {
     const rallyCenter = this.toVec3(this.rallyPoint);
 
@@ -520,6 +529,32 @@ export class MineflayerTradingRoutine {
     }
 
     return this.isInsideShelterArea(this.bot.entity.position.floored());
+  }
+
+  private isBotWithinShelterBounds(): boolean {
+    if (!this.bot.entity) {
+      return false;
+    }
+
+    const position = this.toBlockPosition(this.bot.entity.position);
+    const wallPositions = this.shelterLayout.getWallPositions(this.rallyPoint);
+
+    if (wallPositions.length === 0) {
+      return this.isBotInsideShelter();
+    }
+
+    const minX = Math.min(...wallPositions.map((wall) => wall.x));
+    const maxX = Math.max(...wallPositions.map((wall) => wall.x));
+    const minZ = Math.min(...wallPositions.map((wall) => wall.z));
+    const maxZ = Math.max(...wallPositions.map((wall) => wall.z));
+
+    return (
+      position.x >= minX &&
+      position.x <= maxX &&
+      position.z >= minZ &&
+      position.z <= maxZ &&
+      position.y === this.rallyPoint.y
+    );
   }
 
   private isInsideShelterArea(position: Vec3): boolean {
