@@ -18,9 +18,11 @@ export class MineflayerNearbyDroppedItemCollector {
   private readonly pickupAttemptLimit = 4;
   private readonly pickupStepDistance = 0.5;
   private readonly pickupGoalRange = 1;
+  private readonly unreachableItemCooldownMs = 30000;
   private collectionPromise: Promise<boolean> | null = null;
   private intervalId: NodeJS.Timeout | null = null;
   private backgroundCollectionSuppressedUntil = 0;
+  private readonly temporarilyUnreachableItems = new Map<string, number>();
 
   constructor(
     private readonly bot: BotWithPathfinder,
@@ -138,6 +140,7 @@ export class MineflayerNearbyDroppedItemCollector {
         attempt === 1 ? droppedItem.position : this.buildPickupStepTarget(droppedItem.position);
 
       if (!targetPosition) {
+        this.markDroppedItemAsTemporarilyUnreachable(droppedItem.position);
         return false;
       }
 
@@ -152,6 +155,7 @@ export class MineflayerNearbyDroppedItemCollector {
         }
 
         if (attempt === this.pickupAttemptLimit) {
+          this.markDroppedItemAsTemporarilyUnreachable(droppedItem.position);
           this.logger.warn(
             `Skipping dropped-item collection near ${droppedItem.position.x.toFixed(1)} ${droppedItem.position.y.toFixed(1)} ${droppedItem.position.z.toFixed(1)} after ${this.pickupAttemptLimit} attempts: ${this.stringifyError(error)}`,
           );
@@ -168,6 +172,7 @@ export class MineflayerNearbyDroppedItemCollector {
       }
     }
 
+    this.markDroppedItemAsTemporarilyUnreachable(droppedItemPosition);
     this.logger.warn(
       `Skipping dropped-item collection near ${droppedItemPosition.x.toFixed(1)} ${droppedItemPosition.y.toFixed(1)} ${droppedItemPosition.z.toFixed(1)} because the item stayed out of reach after ${this.pickupAttemptLimit} attempts.`,
     );
@@ -201,8 +206,11 @@ export class MineflayerNearbyDroppedItemCollector {
     horizontalRange: number,
     verticalRange: number,
   ): DroppedItemEntity | null {
+    this.pruneExpiredTemporarilyUnreachableItems();
+
     return Object.values(this.bot.entities as Record<string, DroppedItemEntity | undefined>)
       .filter((entity): entity is DroppedItemEntity => this.isDroppedItemEntity(entity))
+      .filter((entity) => !this.isDroppedItemTemporarilySuppressed(entity.position))
       .filter((entity) => this.isWithinCollectionRange(entity.position, center, horizontalRange, verticalRange))
       .sort((left, right) => this.distanceSquared(left.position, center) - this.distanceSquared(right.position, center))[0] ?? null;
   }
@@ -259,5 +267,34 @@ export class MineflayerNearbyDroppedItemCollector {
     }
 
     return String(error);
+  }
+
+  private markDroppedItemAsTemporarilyUnreachable(position: Vec3): void {
+    this.temporarilyUnreachableItems.set(
+      this.getDroppedItemSuppressionKey(position),
+      Date.now() + this.unreachableItemCooldownMs,
+    );
+  }
+
+  private isDroppedItemTemporarilySuppressed(position: Vec3): boolean {
+    const suppressedUntil = this.temporarilyUnreachableItems.get(
+      this.getDroppedItemSuppressionKey(position),
+    );
+
+    return typeof suppressedUntil === 'number' && suppressedUntil > Date.now();
+  }
+
+  private pruneExpiredTemporarilyUnreachableItems(): void {
+    const now = Date.now();
+
+    for (const [key, suppressedUntil] of this.temporarilyUnreachableItems.entries()) {
+      if (suppressedUntil <= now) {
+        this.temporarilyUnreachableItems.delete(key);
+      }
+    }
+  }
+
+  private getDroppedItemSuppressionKey(position: Vec3): string {
+    return `${Math.floor(position.x)}:${Math.floor(position.y)}:${Math.floor(position.z)}`;
   }
 }

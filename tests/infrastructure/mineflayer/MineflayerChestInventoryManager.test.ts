@@ -137,3 +137,140 @@ test('MineflayerChestInventoryManager does not open a chest through a wall when 
     true,
   );
 });
+
+test('MineflayerChestInventoryManager approaches a nearby side tile instead of pathing into the chest block itself', async () => {
+  const gotoTargets: Vec3[] = [];
+  const bot = {
+    entity: { position: new Vec3(215, 64, -78), height: 1.62 },
+    inventory: {
+      items: () => [],
+      emptySlotCount: () => 10,
+    },
+    registry: {
+      blocksByName: {
+        chest: { id: 54 },
+        trapped_chest: { id: 146 },
+      },
+    },
+    findBlocks: () => [new Vec3(210, 65, -77)],
+    blockAt: (position: Vec3) => ({ position, name: 'chest' }),
+    world: {},
+    openChest: async () => ({
+      containerItems: () => [{ name: 'white_wool', count: 32, type: 35 }],
+      deposit: async () => undefined,
+      withdraw: async () => undefined,
+      close: () => undefined,
+    }),
+  };
+
+  const manager = new MineflayerChestInventoryManager(
+    bot as never,
+    new TestLogger(),
+    async (target: Vec3) => {
+      gotoTargets.push(target.clone());
+    },
+  );
+
+  await manager.restockItems(new Vec3(215, 64, -77), [
+    { itemId: 'white_wool', targetCount: 16 },
+  ]);
+
+  assert.equal(
+    gotoTargets.some((target) => target.x === 210 && target.y === 65 && target.z === -77),
+    false,
+  );
+  assert.equal(gotoTargets.length > 0, true);
+});
+
+test('MineflayerChestInventoryManager inspects a double chest only once when both halves are discovered', async () => {
+  let openChestCalls = 0;
+  const chestBlocks = new Map<string, { position: Vec3; name: string }>([
+    ['210:65:-77', { position: new Vec3(210, 65, -77), name: 'chest' }],
+    ['211:65:-77', { position: new Vec3(211, 65, -77), name: 'chest' }],
+  ]);
+  const bot = {
+    entity: { position: new Vec3(209, 64, -77), height: 1.62 },
+    inventory: {
+      items: () => [],
+      emptySlotCount: () => 10,
+    },
+    registry: {
+      blocksByName: {
+        chest: { id: 54 },
+        trapped_chest: { id: 146 },
+      },
+    },
+    findBlocks: () => [new Vec3(210, 65, -77), new Vec3(211, 65, -77)],
+    blockAt: (position: Vec3) => chestBlocks.get(`${position.x}:${position.y}:${position.z}`) ?? null,
+    world: {
+      raycast: () => ({ position: new Vec3(210, 65, -77) }),
+    },
+    openChest: async () => {
+      openChestCalls += 1;
+
+      return {
+        containerItems: () => [{ name: 'white_wool', count: 32, type: 35 }],
+        deposit: async () => undefined,
+        withdraw: async () => undefined,
+        close: () => undefined,
+      };
+    },
+  };
+
+  const manager = new MineflayerChestInventoryManager(
+    bot as never,
+    new TestLogger(),
+    async () => undefined,
+  );
+
+  await manager.restockItems(new Vec3(209, 64, -77), [
+    { itemId: 'white_wool', targetCount: 64 },
+  ]);
+
+  assert.equal(openChestCalls, 1);
+});
+
+test('MineflayerChestInventoryManager prefers chests that were not inspected in the current nearby storage sweep', async () => {
+  const chestA = { position: new Vec3(210, 65, -77), name: 'chest', boundingBox: 'block' };
+  const chestB = { position: new Vec3(212, 65, -77), name: 'chest', boundingBox: 'block' };
+  const chestBlocks = new Map<string, { position: Vec3; name: string; boundingBox: string }>([
+    ['210:65:-77', chestA],
+    ['212:65:-77', chestB],
+  ]);
+  const openedChestKeys: string[] = [];
+  const bot = {
+    entity: { position: new Vec3(209, 64, -77), height: 1.62 },
+    inventory: {
+      items: () => [],
+      emptySlotCount: () => 10,
+    },
+    registry: {
+      blocksByName: {
+        chest: { id: 54 },
+        trapped_chest: { id: 146 },
+      },
+    },
+    findBlocks: () => [new Vec3(210, 65, -77), new Vec3(212, 65, -77)],
+    blockAt: (position: Vec3) => chestBlocks.get(`${position.x}:${position.y}:${position.z}`) ?? null,
+    world: {},
+    openChest: async (block: { position: Vec3 }) => ({
+      containerItems: () => [{ name: 'white_wool', count: 32, type: 35 }],
+      deposit: async () => undefined,
+      withdraw: async () => {
+        openedChestKeys.push(`${block.position.x}:${block.position.y}:${block.position.z}`);
+      },
+      close: () => undefined,
+    }),
+  };
+
+  const manager = new MineflayerChestInventoryManager(
+    bot as never,
+    new TestLogger(),
+    async () => undefined,
+  );
+
+  await manager.restockItems(new Vec3(209, 64, -77), [{ itemId: 'white_wool', targetCount: 16 }]);
+  await manager.restockItems(new Vec3(209, 64, -77), [{ itemId: 'white_wool', targetCount: 16 }]);
+
+  assert.deepEqual(openedChestKeys, ['210:65:-77', '212:65:-77']);
+});

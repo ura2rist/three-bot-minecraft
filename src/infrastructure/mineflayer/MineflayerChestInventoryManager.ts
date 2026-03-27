@@ -16,9 +16,17 @@ export interface ChestRestockRequest {
   targetCount: number;
 }
 
+interface ChestInspectionSweep {
+  startedAt: number;
+  inspectedKeys: Set<string>;
+}
+
 export class MineflayerChestInventoryManager {
   private readonly chestSearchRadius = 12;
   private readonly directInteractionPadding = 0.5;
+  private readonly chestApproachRange = 1;
+  private readonly chestInspectionSweepWindowMs = 60000;
+  private readonly inspectionSweepsByOrigin = new Map<string, ChestInspectionSweep>();
 
   constructor(
     private readonly bot: BotWithPathfinder,
@@ -47,14 +55,14 @@ export class MineflayerChestInventoryManager {
 
     let depositedItemCount = 0;
 
-    for (const chestBlock of chests) {
+    for (const chestBlock of this.prioritizeChestBlocksForInspection(storageOrigin, chests)) {
       const pendingItems = this.bot.inventory.items().filter((item) => !shouldKeepItem(item));
 
       if (pendingItems.length === 0) {
         break;
       }
 
-      const chest = await this.openChest(chestBlock);
+      const chest = await this.openChest(chestBlock, storageOrigin);
 
       if (!chest) {
         continue;
@@ -104,12 +112,12 @@ export class MineflayerChestInventoryManager {
       return fulfilledCounts;
     }
 
-    for (const chestBlock of chests) {
+    for (const chestBlock of this.prioritizeChestBlocksForInspection(storageOrigin, chests)) {
       if (pendingRequests.every((request) => request.remaining <= 0)) {
         break;
       }
 
-      const chest = await this.openChest(chestBlock);
+      const chest = await this.openChest(chestBlock, storageOrigin);
 
       if (!chest) {
         continue;
@@ -176,30 +184,62 @@ export class MineflayerChestInventoryManager {
       count: 32,
     });
 
-    return positions
+    const chestsByCanonicalPosition = new Map<string, Block>();
+
+    for (const chestBlock of positions
       .map((position) => this.bot.blockAt(position))
       .filter((block): block is Block => block !== null)
-      .sort((left, right) => origin.distanceTo(left.position) - origin.distanceTo(right.position));
+      .sort((left, right) => origin.distanceTo(left.position) - origin.distanceTo(right.position))) {
+      const canonicalPosition = this.getCanonicalChestPosition(chestBlock);
+      const canonicalKey = `${canonicalPosition.x}:${canonicalPosition.y}:${canonicalPosition.z}`;
+
+      if (!chestsByCanonicalPosition.has(canonicalKey)) {
+        chestsByCanonicalPosition.set(canonicalKey, chestBlock);
+      }
+    }
+
+    return [...chestsByCanonicalPosition.values()];
   }
 
-  private async openChest(chestBlock: Block): Promise<ChestWindow | null> {
+  private async openChest(chestBlock: Block, storageOrigin: Vec3): Promise<ChestWindow | null> {
+    let lastError: unknown = null;
+    let lineOfSightBlocked = false;
+
     try {
-      await this.gotoPosition(chestBlock.position, 2);
+      for (const approachPosition of this.getChestApproachPositions(chestBlock)) {
+        try {
+          await this.gotoPosition(approachPosition, this.chestApproachRange);
+        } catch (error) {
+          lastError = error;
+          continue;
+        }
 
-      if (!this.hasDirectInteractionLineOfSight(chestBlock)) {
-        this.logger.warn(
-          `Could not open a chest at ${chestBlock.position.x} ${chestBlock.position.y} ${chestBlock.position.z}: it is not in direct line of sight.`,
-        );
-        return null;
+        if (!this.hasDirectInteractionLineOfSight(chestBlock)) {
+          lineOfSightBlocked = true;
+          continue;
+        }
+
+        try {
+          return (await this.bot.openChest(chestBlock)) as unknown as ChestWindow;
+        } catch (error) {
+          lastError = error;
+        }
       }
+    } finally {
+      this.markChestAsInspected(storageOrigin, chestBlock);
+    }
 
-      return (await this.bot.openChest(chestBlock)) as unknown as ChestWindow;
-    } catch (error) {
+    if (lineOfSightBlocked) {
       this.logger.warn(
-        `Could not open a chest at ${chestBlock.position.x} ${chestBlock.position.y} ${chestBlock.position.z}: ${this.stringifyError(error)}.`,
+        `Could not open a chest at ${chestBlock.position.x} ${chestBlock.position.y} ${chestBlock.position.z}: it is not in direct line of sight.`,
       );
       return null;
     }
+
+    this.logger.warn(
+      `Could not open a chest at ${chestBlock.position.x} ${chestBlock.position.y} ${chestBlock.position.z}: ${this.stringifyError(lastError)}.`,
+    );
+    return null;
   }
 
   private stringifyError(error: unknown): string {
@@ -247,5 +287,99 @@ export class MineflayerChestInventoryManager {
 
       return !!hit?.position && hit.position.equals(targetBlock.position);
     });
+  }
+
+  private getChestApproachPositions(chestBlock: Block): Vec3[] {
+    const candidates = [
+      ...this.getCardinalOffsets().map((offset) => chestBlock.position.plus(offset)),
+      ...this.getCardinalOffsets().map((offset) => chestBlock.position.plus(offset).offset(0, -1, 0)),
+    ];
+    const uniqueCandidates = [...new Map(
+      candidates.map((candidate) => [`${candidate.x}:${candidate.y}:${candidate.z}`, candidate]),
+    ).values()];
+    const origin = this.bot.entity?.position ?? chestBlock.position;
+
+    return uniqueCandidates.sort(
+      (left, right) => left.distanceSquared(origin) - right.distanceSquared(origin),
+    );
+  }
+
+  private getCardinalOffsets(): Vec3[] {
+    return [
+      new Vec3(1, 0, 0),
+      new Vec3(-1, 0, 0),
+      new Vec3(0, 0, 1),
+      new Vec3(0, 0, -1),
+    ];
+  }
+
+  private getCanonicalChestPosition(chestBlock: Block): Vec3 {
+    const connectedChestPositions = [
+      chestBlock.position,
+      ...this.getCardinalOffsets()
+        .map((offset) => chestBlock.position.plus(offset))
+        .filter((position) => {
+          const candidate = this.bot.blockAt(position);
+
+          return !!candidate && candidate.name === chestBlock.name;
+        }),
+    ];
+
+    return connectedChestPositions.sort((left, right) => {
+      if (left.x !== right.x) {
+        return left.x - right.x;
+      }
+
+      if (left.y !== right.y) {
+        return left.y - right.y;
+      }
+
+      return left.z - right.z;
+    })[0]!;
+  }
+
+  private prioritizeChestBlocksForInspection(storageOrigin: Vec3, chestBlocks: readonly Block[]): Block[] {
+    const sweep = this.getInspectionSweep(storageOrigin);
+    const freshBlocks = chestBlocks.filter((chestBlock) => {
+      return !sweep.inspectedKeys.has(this.getChestInspectionKey(chestBlock));
+    });
+
+    if (freshBlocks.length > 0) {
+      return freshBlocks;
+    }
+
+    sweep.startedAt = Date.now();
+    sweep.inspectedKeys.clear();
+    return [...chestBlocks];
+  }
+
+  private getChestInspectionKey(chestBlock: Block): string {
+    const canonicalPosition = this.getCanonicalChestPosition(chestBlock);
+    return `${canonicalPosition.x}:${canonicalPosition.y}:${canonicalPosition.z}`;
+  }
+
+  private getInspectionSweep(storageOrigin: Vec3): ChestInspectionSweep {
+    const originKey = this.getStorageOriginKey(storageOrigin);
+    const now = Date.now();
+    const existingSweep = this.inspectionSweepsByOrigin.get(originKey);
+
+    if (existingSweep && now - existingSweep.startedAt < this.chestInspectionSweepWindowMs) {
+      return existingSweep;
+    }
+
+    const nextSweep: ChestInspectionSweep = {
+      startedAt: now,
+      inspectedKeys: new Set<string>(),
+    };
+    this.inspectionSweepsByOrigin.set(originKey, nextSweep);
+    return nextSweep;
+  }
+
+  private markChestAsInspected(storageOrigin: Vec3, chestBlock: Block): void {
+    this.getInspectionSweep(storageOrigin).inspectedKeys.add(this.getChestInspectionKey(chestBlock));
+  }
+
+  private getStorageOriginKey(storageOrigin: Vec3): string {
+    return `${Math.floor(storageOrigin.x)}:${Math.floor(storageOrigin.y)}:${Math.floor(storageOrigin.z)}`;
   }
 }

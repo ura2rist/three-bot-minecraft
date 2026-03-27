@@ -8,13 +8,15 @@ import { BotPriorityCoordinator } from '../../application/bot/services/BotPriori
 import { SquadWeaponReadinessTracker } from '../../application/bot/services/SquadWeaponReadinessTracker';
 import { BotClient } from '../../application/bot/ports/BotClient';
 import { FarmRoleSettingsProvider } from '../../application/bot/ports/FarmRoleSettingsProvider';
+import { MineRoleSettingsProvider } from '../../application/bot/ports/MineRoleSettingsProvider';
+import { MineRoutineProgressStore } from '../../application/bot/ports/MineRoutineProgressStore';
 import { TradingRoleSettingsProvider } from '../../application/bot/ports/TradingRoleSettingsProvider';
 import { EstablishMicroBaseService } from '../../application/bot/services/EstablishMicroBaseService';
 import { DeterministicMicroBaseAssignmentPolicy } from '../../application/bot/services/DeterministicMicroBaseAssignmentPolicy';
 import { EnsureCraftingTableNearRallyPointService } from '../../application/bot/services/EnsureCraftingTableNearRallyPointService';
 import { RandomCraftingTableAssignmentPolicy } from '../../application/bot/services/RandomCraftingTableAssignmentPolicy';
 import { BotConfiguration } from '../../domain/bot/entities/BotConfiguration';
-import { FarmRoleSettings, TradingRoleSettings } from '../../domain/bot/entities/RoleSettings';
+import { FarmRoleSettings, MineRoleSettings, TradingRoleSettings } from '../../domain/bot/entities/RoleSettings';
 import { Logger } from '../../application/shared/ports/Logger';
 import { LightAuthBotAuthenticator } from './LightAuthBotAuthenticator';
 import { MineflayerAutoEatController } from './MineflayerAutoEatController';
@@ -26,6 +28,7 @@ import { MineflayerNearbyDroppedItemCollector } from './MineflayerNearbyDroppedI
 import { MineflayerLogHarvestingPort } from './MineflayerLogHarvestingPort';
 import { MineflayerSquadDefenseController } from './MineflayerSquadDefenseController';
 import { MineflayerFarmRoutine } from './MineflayerFarmRoutine';
+import { MineflayerMineRoutine } from './MineflayerMineRoutine';
 import { MineflayerTradingRoutine } from './MineflayerTradingRoutine';
 import type { BotWithPathfinder, PathfinderApi, PathfinderMovements } from './MineflayerPortsShared';
 import { InMemoryEventBus } from '../events/InMemoryEventBus';
@@ -75,6 +78,7 @@ export class MineflayerBotClient implements BotClient {
     3,
   );
   private readonly rallyTimeoutMs = this.parseInteger(process.env.BOT_RALLY_TIMEOUT_MS, 120000);
+  private readonly rallyDoorTraversalDepth = 2;
   private readonly rallyRetryDelayMs = this.parseInteger(process.env.BOT_RALLY_RETRY_DELAY_MS, 3000);
   private readonly rallySingleAttemptTimeoutMs = this.parseInteger(
     process.env.BOT_RALLY_SINGLE_ATTEMPT_TIMEOUT_MS,
@@ -112,14 +116,18 @@ export class MineflayerBotClient implements BotClient {
   private readonly connectedPathfinderBots = new Map<string, BotWithClient>();
   private readonly tradingRoleSettings: TradingRoleSettings;
   private readonly farmRoleSettings: FarmRoleSettings;
+  private readonly mineRoleSettings: MineRoleSettings;
 
   constructor(
     private readonly logger: Logger,
     tradingRoleSettingsProvider: TradingRoleSettingsProvider,
     farmRoleSettingsProvider: FarmRoleSettingsProvider,
+    mineRoleSettingsProvider: MineRoleSettingsProvider,
+    private readonly mineRoutineProgressStore: MineRoutineProgressStore,
   ) {
     this.tradingRoleSettings = tradingRoleSettingsProvider.load();
     this.farmRoleSettings = farmRoleSettingsProvider.load();
+    this.mineRoleSettings = mineRoleSettingsProvider.load();
   }
 
   prepareFleet(configurations: readonly BotConfiguration[]): void {
@@ -220,6 +228,7 @@ export class MineflayerBotClient implements BotClient {
     let nightlyShelterRoutineStarted = false;
     let tradingRoutineStarted = false;
     let farmRoutineStarted = false;
+    let mineRoutineStarted = false;
     let farmThreatAvoidanceMode = false;
     let spawnCount = 0;
     let configurationSettingsSent = false;
@@ -276,6 +285,7 @@ export class MineflayerBotClient implements BotClient {
       nightlyShelterRoutineStarted = false;
       tradingRoutineStarted = false;
       farmRoutineStarted = false;
+      mineRoutineStarted = false;
       farmThreatAvoidanceMode = false;
       bot.pathfinder?.stop();
       logger.info(`Stopped active scenarios: ${reason}.`);
@@ -298,7 +308,13 @@ export class MineflayerBotClient implements BotClient {
         pathfinderBot,
         logger.child('pickup'),
         (target, range) => this.gotoPosition(pathfinderBot, target, range),
-        () => priorityCoordinator.getCurrentTask() === 'idle',
+        () =>
+          priorityCoordinator.getCurrentTask() === 'idle' &&
+          !microBaseScenarioStarted &&
+          !nightlyShelterRoutineStarted &&
+          !tradingRoutineStarted &&
+          !farmRoutineStarted &&
+          !mineRoutineStarted,
       );
       return nearbyDroppedItemCollector;
     };
@@ -516,6 +532,51 @@ export class MineflayerBotClient implements BotClient {
           }
         });
     };
+    const startMineRoutine = (scenarioGeneration: number) => {
+      if (configuration.role !== 'mine' || !configuration.rallyPoint || mineRoutineStarted) {
+        return;
+      }
+
+      mineRoutineStarted = true;
+      const mineLogger = logger.child('mine-main');
+      const pathfinderBot = this.requirePathfinderBot(bot);
+      const mineRoutine = new MineflayerMineRoutine(
+        pathfinderBot,
+        mineLogger,
+        configuration.rallyPoint,
+        this.mineRoleSettings,
+        (target, range) => this.gotoPosition(pathfinderBot, target, range),
+        new MineflayerLogHarvestingPort(
+          pathfinderBot,
+          mineLogger,
+          (target, range) => this.gotoPosition(pathfinderBot, target, range),
+          getNearbyDroppedItemCollector(),
+          createScenarioWaiter(scenarioGeneration),
+          () => priorityCoordinator.isThreatResponseActive(),
+        ),
+        getNearbyDroppedItemCollector(),
+        this.mineRoutineProgressStore,
+        () => scenarioGeneration === microBaseScenarioGeneration,
+        createScenarioWaiter(scenarioGeneration),
+      );
+
+      void mineRoutine
+        .maintain()
+        .catch((error) => {
+          if (scenarioGeneration !== microBaseScenarioGeneration) {
+            return;
+          }
+
+          mineLogger.warn(
+            `Mine main routine stopped unexpectedly: ${this.stringifyError(error)}.`,
+          );
+        })
+        .finally(() => {
+          if (scenarioGeneration === microBaseScenarioGeneration) {
+            mineRoutineStarted = false;
+          }
+        });
+    };
     const startMicroBaseScenario = () => {
       if (!configuration.rallyPoint || microBaseScenarioStarted) {
         return;
@@ -548,6 +609,7 @@ export class MineflayerBotClient implements BotClient {
           startNightlyShelterRoutine(scenarioGeneration, microBaseLogger);
           startTradingRoutine(scenarioGeneration, microBaseLogger);
           startFarmRoutine(scenarioGeneration);
+          startMineRoutine(scenarioGeneration);
         })
         .catch(async (error) => {
           if (error instanceof MicroBaseScenarioCancelledError) {
@@ -566,6 +628,7 @@ export class MineflayerBotClient implements BotClient {
             nightlyShelterRoutineStarted = false;
             tradingRoutineStarted = false;
             farmRoutineStarted = false;
+            mineRoutineStarted = false;
             farmThreatAvoidanceMode = false;
             await priorityCoordinator.waitUntilTaskMayProceed(
               () => scenarioGeneration === microBaseScenarioGeneration,
@@ -1222,30 +1285,35 @@ export class MineflayerBotClient implements BotClient {
       return false;
     }
 
-    const rallyPoint = configuration.rallyPoint;
-    const xDistanceToRally = rallyPoint.x - nearbyDoor.position.x;
-    const zDistanceToRally = rallyPoint.z - nearbyDoor.position.z;
-    const moveAlongX = Math.abs(xDistanceToRally) >= Math.abs(zDistanceToRally);
-    const step = moveAlongX
-      ? new Vec3(Math.sign(xDistanceToRally) || 1, 0, 0)
-      : new Vec3(0, 0, Math.sign(zDistanceToRally) || 1);
-    const interiorTarget = new Vec3(
-      nearbyDoor.position.x + step.x * 2,
-      configuration.rallyPoint.y,
-      nearbyDoor.position.z + step.z * 2,
+    const { outsideApproach, insideDoorStep, insideDepthTarget } = this.getRallyDoorTraversalTargets(
+      bot,
+      nearbyDoor.position,
+      configuration,
     );
     const distanceBeforeDoorAssist = this.calculateDistanceToGoal(bot, configuration);
 
     try {
       this.assertCurrentRallyNavigationAttempt(isCurrentAttempt);
-      await this.gotoPosition(bot as BotWithPathfinder, nearbyDoor.position, 1);
+      await this.gotoPosition(bot as BotWithPathfinder, outsideApproach, 1);
       this.assertCurrentRallyNavigationAttempt(isCurrentAttempt);
 
       await this.openDoorIfNeeded(bot, nearbyDoor);
 
-      this.assertCurrentRallyNavigationAttempt(isCurrentAttempt);
-      await this.stepTowardsTarget(bot, interiorTarget, 10);
-      await this.gotoPosition(bot as BotWithPathfinder, interiorTarget, 1).catch(() => undefined);
+      if (this.calculateDistanceBetweenPositions(bot.entity?.position, insideDoorStep) > 1.1) {
+        this.assertCurrentRallyNavigationAttempt(isCurrentAttempt);
+        await this.stepTowardsTarget(bot, insideDoorStep, 16);
+      }
+
+      if (this.calculateDistanceBetweenPositions(bot.entity?.position, insideDoorStep) > 1.1) {
+        this.assertCurrentRallyNavigationAttempt(isCurrentAttempt);
+        await this.gotoPosition(bot as BotWithPathfinder, insideDoorStep, 1).catch(() => undefined);
+      }
+
+      if (this.calculateDistanceBetweenPositions(bot.entity?.position, insideDepthTarget) > 1.1) {
+        this.assertCurrentRallyNavigationAttempt(isCurrentAttempt);
+        await this.gotoPosition(bot as BotWithPathfinder, insideDepthTarget, 1).catch(() => undefined);
+      }
+
       const distanceAfterDoorAssist = this.calculateDistanceToGoal(bot, configuration);
 
       if (
@@ -1304,6 +1372,26 @@ export class MineflayerBotClient implements BotClient {
     return Math.sqrt(dx * dx + dz * dz);
   }
 
+  private calculateDistanceFromPositionToRally(position: Vec3, configuration: BotConfiguration): number {
+    if (!configuration.rallyPoint) {
+      return Number.POSITIVE_INFINITY;
+    }
+
+    const dx = position.x - configuration.rallyPoint.x;
+    const dy = position.y - configuration.rallyPoint.y;
+    const dz = position.z - configuration.rallyPoint.z;
+
+    return Math.sqrt(dx * dx + dy * dy + dz * dz);
+  }
+
+  private calculateDistanceBetweenPositions(left: Vec3 | null | undefined, right: Vec3): number {
+    if (!left) {
+      return Number.POSITIVE_INFINITY;
+    }
+
+    return left.distanceTo(right);
+  }
+
   private findNearestDoorNearRallyPoint(bot: BotWithClient, configuration: BotConfiguration): Block | null {
     if (!configuration.rallyPoint || !bot.entity) {
       return null;
@@ -1341,6 +1429,69 @@ export class MineflayerBotClient implements BotClient {
     }
 
     return nearestDoor;
+  }
+
+  private getRallyDoorTraversalTargets(
+    bot: BotWithClient,
+    doorPosition: Vec3,
+    configuration: BotConfiguration,
+  ): {
+    outsideApproach: Vec3;
+    insideDoorStep: Vec3;
+    insideDepthTarget: Vec3;
+  } {
+    const passableApproaches = this.getRallyDoorApproachPositions(doorPosition, configuration)
+      .filter((position) => this.isPassableRallyStandPosition(bot, position));
+    const insideDoorStep =
+      passableApproaches[0] ??
+      new Vec3(doorPosition.x, configuration.rallyPoint?.y ?? doorPosition.y, doorPosition.z);
+    const outsideApproach =
+      [...passableApproaches].reverse().find((position) => !position.equals(insideDoorStep)) ?? doorPosition;
+    const inwardOffset = insideDoorStep.minus(doorPosition);
+    const preferredInsideDepthTarget = insideDoorStep.plus(
+      inwardOffset.scaled(Math.max(1, this.rallyDoorTraversalDepth - 1)),
+    );
+
+    return {
+      outsideApproach,
+      insideDoorStep,
+      insideDepthTarget: this.resolveRallyDoorTraversalTarget(
+        bot,
+        preferredInsideDepthTarget,
+        insideDoorStep,
+      ),
+    };
+  }
+
+  private getRallyDoorApproachPositions(
+    doorPosition: Vec3,
+    configuration: BotConfiguration,
+  ): Vec3[] {
+    return [
+      doorPosition.offset(1, 0, 0),
+      doorPosition.offset(-1, 0, 0),
+      doorPosition.offset(0, 0, 1),
+      doorPosition.offset(0, 0, -1),
+    ].sort(
+      (left, right) =>
+        this.calculateDistanceFromPositionToRally(left, configuration) -
+        this.calculateDistanceFromPositionToRally(right, configuration),
+    );
+  }
+
+  private resolveRallyDoorTraversalTarget(bot: BotWithClient, preferredTarget: Vec3, fallbackTarget: Vec3): Vec3 {
+    return this.isPassableRallyStandPosition(bot, preferredTarget) ? preferredTarget : fallbackTarget;
+  }
+
+  private isPassableRallyStandPosition(bot: BotWithClient, position: Vec3): boolean {
+    const feetBlock = bot.blockAt(position);
+    const headBlock = bot.blockAt(position.offset(0, 1, 0));
+
+    return this.isPassableRallyBlock(feetBlock) && this.isPassableRallyBlock(headBlock);
+  }
+
+  private isPassableRallyBlock(block: Block | null): boolean {
+    return !block || block.boundingBox === 'empty';
   }
 
   private normalizeDoorBlock(bot: BotWithClient, block: Block): Block | null {

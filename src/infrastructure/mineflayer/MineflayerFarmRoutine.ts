@@ -263,8 +263,16 @@ export class MineflayerFarmRoutine {
 
   private async processFarmZone(plot: SupportedFarmPlot, point: FarmPointSettings): Promise<boolean> {
     const farmCells = this.getFarmCells(point);
+    const processedCells = new Set<string>();
 
     for (const cell of farmCells) {
+      const cellKey = `${cell.x}:${cell.y}:${cell.z}`;
+
+      if (processedCells.has(cellKey)) {
+        continue;
+      }
+
+      processedCells.add(cellKey);
       await this.waitForScenarioWindow();
 
       if (this.shouldPauseForNightlyShelter() || this.shouldRetreatToShelter()) {
@@ -299,7 +307,7 @@ export class MineflayerFarmRoutine {
     if (cropBlock) {
       const cropDefinition = this.getCropDefinitionForBlock(cropBlock);
 
-      if (cropDefinition && this.isMatureCropBlock(cropBlock, cropDefinition)) {
+      if (this.shouldReplaceCropBlock(plot, cropBlock, cropDefinition)) {
         await this.harvestCrop(cropBlock);
         await this.nearbyDroppedItemCollector.collectAround(cropPosition, 2, 2).catch(() => undefined);
       }
@@ -466,8 +474,17 @@ export class MineflayerFarmRoutine {
       await this.moveNearIfNeeded(craftingTable.position, 2);
     }
 
-    await this.bot.craft(recipe, 1, craftingTable ?? undefined);
-    return true;
+    try {
+      await this.bot.craft(recipe, 1, craftingTable ?? undefined);
+      return true;
+    } catch (error) {
+      if (this.isMissingIngredientCraftError(error)) {
+        await this.bot.waitForTicks(5);
+        return false;
+      }
+
+      throw error;
+    }
   }
 
   private requireNearbyCraftingTable(): Block {
@@ -953,34 +970,22 @@ export class MineflayerFarmRoutine {
     const cells: Vec3[] = [];
 
     for (let ring = 1; ring <= this.farmingRadius; ring += 1) {
-      for (let dx = -(ring - 1); dx <= ring; dx += 1) {
-        cells.push(new Vec3(center.x + dx, center.y, center.z - ring));
-      }
+      for (let dz = -ring; dz <= ring; dz += 1) {
+        for (let dx = -ring; dx <= ring; dx += 1) {
+          if (Math.max(Math.abs(dx), Math.abs(dz)) !== ring) {
+            continue;
+          }
 
-      for (let dz = -(ring - 1); dz <= ring; dz += 1) {
-        cells.push(new Vec3(center.x + ring, center.y, center.z + dz));
-      }
+          if (dx === 0 && dz === 0) {
+            continue;
+          }
 
-      for (let dx = ring - 1; dx >= -ring; dx -= 1) {
-        cells.push(new Vec3(center.x + dx, center.y, center.z + ring));
-      }
-
-      for (let dz = ring - 1; dz >= -ring; dz -= 1) {
-        cells.push(new Vec3(center.x - ring, center.y, center.z + dz));
+          cells.push(new Vec3(center.x + dx, center.y, center.z + dz));
+        }
       }
     }
 
-    const uniqueCells = new Map<string, Vec3>();
-
-    for (const cell of cells) {
-      if (cell.x === center.x && cell.z === center.z) {
-        continue;
-      }
-
-      uniqueCells.set(`${cell.x}:${cell.y}:${cell.z}`, cell);
-    }
-
-    return [...uniqueCells.values()];
+    return cells;
   }
 
   private isMatureCropBlock(block: Block, definition: FarmCropDefinition): boolean {
@@ -1215,7 +1220,7 @@ export class MineflayerFarmRoutine {
     if (cropBlock) {
       const cropDefinition = this.getCropDefinitionForBlock(cropBlock);
 
-      if (cropDefinition && this.isMatureCropBlock(cropBlock, cropDefinition)) {
+      if (this.shouldReplaceCropBlock(plot, cropBlock, cropDefinition)) {
         return {
           needsInteraction: true,
           needsHarvest: true,
@@ -1252,6 +1257,22 @@ export class MineflayerFarmRoutine {
     };
   }
 
+  private shouldReplaceCropBlock(
+    plot: SupportedFarmPlot,
+    cropBlock: Block,
+    cropDefinition: FarmCropDefinition | null,
+  ): boolean {
+    if (!cropDefinition) {
+      return false;
+    }
+
+    if (cropDefinition.cropBlockName !== plot.definition.cropBlockName) {
+      return true;
+    }
+
+    return this.isMatureCropBlock(cropBlock, cropDefinition);
+  }
+
   private createFarmMovements(): PathfinderMovements {
     const movements = new Movements(this.bot) as PathfinderMovements;
 
@@ -1263,5 +1284,13 @@ export class MineflayerFarmRoutine {
     movements.maxDropDown = 1;
 
     return movements;
+  }
+
+  private isMissingIngredientCraftError(error: unknown): boolean {
+    if (error instanceof Error) {
+      return error.message.toLowerCase().includes('missing ingredient');
+    }
+
+    return String(error).toLowerCase().includes('missing ingredient');
   }
 }

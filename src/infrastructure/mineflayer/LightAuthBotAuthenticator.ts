@@ -34,9 +34,13 @@ const REGISTER_MATCHER: MessageMatcher = {
     'password too short',
     'password too weak',
     'registration failed',
+    'account limit for this ip',
+    'account limit reached for this ip',
+    'limit of accounts for this ip',
     'пароли не совпадают',
     'пароль слишком короткий',
     'регистрация не удалась',
+    'вы достигли лимита аккаунтов для этого ip-адреса',
   ],
 };
 
@@ -79,8 +83,32 @@ export class LightAuthBotAuthenticator {
     const logger = this.logger.child(`lightauth:${configuration.role}`);
     const password = configuration.password;
 
+    if (!password) {
+      throw new Error(`LightAuth password is unavailable for "${configuration.username}".`);
+    }
+
     logger.info(`Starting LightAuth flow for "${configuration.username}".`);
 
+    await this.sendRegisterCommand(bot, logger, password);
+
+    try {
+      await this.sendLoginCommand(bot, logger, password);
+    } catch (error) {
+      if (!this.isNotRegisteredLoginFailure(error)) {
+        throw error;
+      }
+
+      logger.warn(
+        'LightAuth login reported that the account is not registered. Retrying register once before the final login attempt.',
+      );
+      await this.sendRegisterCommand(bot, logger, password);
+      await this.sendLoginCommand(bot, logger, password);
+    }
+
+    logger.info('Authorization successful.');
+  }
+
+  private async sendRegisterCommand(bot: Bot, logger: Logger, password: string): Promise<void> {
     await this.delay(this.commandDelayMs);
 
     bot.chat(`${this.registerCommand} ${password} ${password}`);
@@ -91,14 +119,15 @@ export class LightAuthBotAuthenticator {
     if (registerResult === 'timeout') {
       logger.warn('No explicit LightAuth register response received. Continuing to login.');
     }
+  }
 
+  private async sendLoginCommand(bot: Bot, logger: Logger, password: string): Promise<void> {
     await this.delay(this.commandDelayMs);
 
     bot.chat(`${this.loginCommand} ${password}`);
     logger.info(`Login command sent: ${this.loginCommand} <hidden>`);
 
     await this.waitForStage(bot, logger, 'login', LOGIN_MATCHER);
-    logger.info('Authorization successful.');
   }
 
   private async waitForStage(
@@ -157,6 +186,15 @@ export class LightAuthBotAuthenticator {
 
   private matches(message: string, patterns: readonly string[]): boolean {
     return patterns.some((pattern) => message.includes(pattern));
+  }
+
+  private isNotRegisteredLoginFailure(error: unknown): boolean {
+    if (!(error instanceof Error)) {
+      return false;
+    }
+
+    const normalized = this.normalizeMessage(error.message);
+    return this.matches(normalized, ['not registered', 'вы не зарегистрированы']);
   }
 
   private normalizeMessage(message: string): string {

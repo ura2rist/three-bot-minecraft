@@ -1,6 +1,6 @@
 {
   "shaft": {
-    "targetDepthY": 12,
+    "targetDepthY": 20,
     "shaftHeight": 3,
     "shaftWidth": 2,
     "shaftLength": 24

@@ -105,6 +105,10 @@ export class MineflayerMicroBasePort implements MicroBasePort {
   private readonly wallHeight = 3;
   private readonly blockPlacementAttempts = 3;
   private readonly blockPlacementRange = 4.5;
+  private readonly buildPositionClearanceAttempts = 4;
+  private readonly buildPositionClearanceWaitTicks = 10;
+  private readonly delayedPlacementConfirmationChecks = 6;
+  private readonly delayedPlacementConfirmationWaitTicks = 5;
   private readonly woodenSwordCraftAttempts = 4;
   private readonly maxConsecutivePlankGatherStalls = 6;
   private readonly buildingMaterialRestockPlanks = 12;
@@ -273,6 +277,7 @@ export class MineflayerMicroBasePort implements MicroBasePort {
       this.logger.info('Shelter structure and door already exist near the rally point. Skipping shelter construction.');
     }
     await this.placeBedsUntilShelterCapacity(rallyPoint);
+    await this.enterShelterForIndoorTask(rallyPoint, 'using the newly placed beds');
     await this.sleepUntilSpawnIsSet(rallyPoint);
   }
 
@@ -311,11 +316,12 @@ export class MineflayerMicroBasePort implements MicroBasePort {
         this.logger.info(
           `Night return window opened at timeOfDay ${this.bot.time.timeOfDay ?? 'unknown'}. Returning to the shelter and preparing to sleep.`,
         );
-        await this.moveInsideShelter(rallyPoint, true);
+        await this.enterShelterForIndoorTask(rallyPoint, 'sleeping for the night');
         sleptDuringTheNight = await this.sleepInShelterForTheNight(rallyPoint);
 
         if (sleptDuringTheNight) {
           await this.waitUntilMorningAfterSleeping();
+          await this.exitShelterForOutdoorTask(rallyPoint, 'resuming the daytime routine after sleeping');
         }
       } catch (error) {
         if (error instanceof MicroBaseScenarioCancelledError) {
@@ -852,7 +858,20 @@ export class MineflayerMicroBasePort implements MicroBasePort {
     for (let attempt = 1; attempt <= this.blockPlacementAttempts; attempt += 1) {
       this.ensureScenarioActive();
       await this.waitForTaskPriority();
-      await this.requestFriendlyBotsToClearPosition(position, 2);
+
+      const cleared = await this.ensureBuildPositionIsClear(position);
+
+      if (!cleared) {
+        const message = `Friendly bot is still blocking block placement at ${position.x} ${position.y} ${position.z}.`;
+
+        if (attempt < this.blockPlacementAttempts) {
+          this.logger.warn(`${message} Retrying.`);
+          await this.bot.waitForTicks(this.buildPositionClearanceWaitTicks);
+          continue;
+        }
+
+        throw new Error(message);
+      }
 
       if (this.hasAllowedBlockAtPosition(position, allowedExistingBlockNames)) {
         return;
@@ -874,12 +893,28 @@ export class MineflayerMicroBasePort implements MicroBasePort {
         throw this.createMissingThingError(`опору для установки блока в точке ${position.x} ${position.y} ${position.z}`);
       }
 
-      await this.bot.equip(item, 'hand');
       let retryRequested = false;
       let lastPlacementError: unknown = new Error('Block placement could not be confirmed.');
+      let lastPlacementItemName = item.name;
 
       for (const placement of placements) {
         try {
+          const placementItem = this.resolvePlacementItem(item, allowedExistingBlockNames);
+
+          if (!placementItem) {
+            if (this.hasAllowedBlockAtPosition(position, allowedExistingBlockNames)) {
+              return;
+            }
+
+            if (await this.waitForDelayedPlacementConfirmation(position, allowedExistingBlockNames)) {
+              return;
+            }
+
+            throw this.createMissingThingError(`подходящий блок для установки в точке ${position.x} ${position.y} ${position.z}`);
+          }
+
+          lastPlacementItemName = placementItem.name;
+          await this.bot.equip(placementItem, 'hand');
           await this.navigateToPlacementPosition(position, placement.faceVector, preferredStandPosition);
 
           if (yaw !== undefined) {
@@ -899,6 +934,13 @@ export class MineflayerMicroBasePort implements MicroBasePort {
           await this.bot.waitForTicks(5);
 
           if (this.hasAllowedBlockAtPosition(position, allowedExistingBlockNames)) {
+            return;
+          }
+
+          if (
+            !placementError &&
+            await this.waitForDelayedPlacementConfirmation(position, allowedExistingBlockNames)
+          ) {
             return;
           }
 
@@ -935,7 +977,7 @@ export class MineflayerMicroBasePort implements MicroBasePort {
 
       if (attempt < this.blockPlacementAttempts && retryRequested) {
         this.logger.warn(
-          `Block placement of ${item.name} at ${position.x} ${position.y} ${position.z}${yaw !== undefined ? ` with yaw ${this.describeYaw(yaw)}` : ''} was not confirmed yet: ${this.stringifyError(lastPlacementError)}. Retrying.`,
+          `Block placement of ${lastPlacementItemName} at ${position.x} ${position.y} ${position.z}${yaw !== undefined ? ` with yaw ${this.describeYaw(yaw)}` : ''} was not confirmed yet: ${this.stringifyError(lastPlacementError)}. Retrying.`,
         );
         await this.bot.waitForTicks(10);
         continue;
@@ -946,6 +988,74 @@ export class MineflayerMicroBasePort implements MicroBasePort {
 
     throw new Error(
       `Block placement at ${position.x} ${position.y} ${position.z} was not confirmed. Current block: ${this.describeBlockAtPosition(position)}.`,
+    );
+  }
+
+  private async ensureBuildPositionIsClear(position: Vec3): Promise<boolean> {
+    for (let attempt = 0; attempt < this.buildPositionClearanceAttempts; attempt += 1) {
+      const blockingBots = this.getFriendlyBotsOccupyingBlock(position);
+
+      if (blockingBots.length === 0) {
+        return true;
+      }
+
+      await this.requestFriendlyBotsToClearPosition(position, 2);
+      await this.bot.waitForTicks(this.buildPositionClearanceWaitTicks);
+    }
+
+    return this.getFriendlyBotsOccupyingBlock(position).length === 0;
+  }
+
+  private resolvePlacementItem(
+    preferredItem: Item,
+    allowedExistingBlockNames: ReadonlySet<string>,
+  ): Item | undefined {
+    const items = this.bot.inventory.items();
+    const exactMatch = items.find((inventoryItem) => inventoryItem.name === preferredItem.name);
+
+    if (exactMatch) {
+      return exactMatch;
+    }
+
+    return items.find((inventoryItem) => allowedExistingBlockNames.has(inventoryItem.name));
+  }
+
+  private async waitForDelayedPlacementConfirmation(
+    position: Vec3,
+    allowedExistingBlockNames: ReadonlySet<string>,
+  ): Promise<boolean> {
+    for (let attempt = 0; attempt < this.delayedPlacementConfirmationChecks; attempt += 1) {
+      await this.bot.waitForTicks(this.delayedPlacementConfirmationWaitTicks);
+
+      if (this.hasAllowedBlockAtPosition(position, allowedExistingBlockNames)) {
+        return true;
+      }
+    }
+
+    return false;
+  }
+
+  private getFriendlyBotsOccupyingBlock(position: Vec3): Entity[] {
+    const entities = Object.values(
+      ((this.bot as BotWithPathfinder & { entities?: Record<string | number, Entity> }).entities ?? {}),
+    );
+
+    return entities.filter((entity) => {
+      const username = (entity as Entity & { username?: string }).username;
+
+      if (!username || username === this.bot.username) {
+        return false;
+      }
+
+      return this.isEntityOccupyingBlock(entity, position);
+    });
+  }
+
+  private isEntityOccupyingBlock(entity: Entity, position: Vec3): boolean {
+    return (
+      Math.floor(entity.position.x) === position.x &&
+      Math.floor(entity.position.y) === position.y &&
+      Math.floor(entity.position.z) === position.z
     );
   }
 
@@ -1171,11 +1281,13 @@ export class MineflayerMicroBasePort implements MicroBasePort {
           }
 
           try {
+            await this.enterShelterForIndoorTask(rallyPoint, 'setting the spawn point');
             await this.navigateTo(bed.position, 2);
             await this.touchBedToSetSpawnPoint(bed);
             this.logger.info(
               `Touched a bed at ${bed.position.x} ${bed.position.y} ${bed.position.z} to set the spawn point during daytime.`,
             );
+            await this.exitShelterForOutdoorTask(rallyPoint, 'resuming outdoor work after setting the spawn point');
             return;
           } catch (error) {
             this.logger.warn(`Could not set the spawn point from a nearby bed yet: ${this.stringifyError(error)}.`);
@@ -1195,7 +1307,7 @@ export class MineflayerMicroBasePort implements MicroBasePort {
         }
 
         try {
-          await this.moveInsideShelter(rallyPoint, true);
+          await this.enterShelterForIndoorTask(rallyPoint, 'setting the spawn point');
           await this.ensureShelterDoorClosedBeforeSleeping(rallyPoint);
           await this.navigateTo(bed.position, 2);
           this.ensureBlockIsInDirectLineOfSight(bed, 'sleep in a nearby bed');
@@ -1219,7 +1331,7 @@ export class MineflayerMicroBasePort implements MicroBasePort {
     while (!this.bot.isSleeping) {
       this.ensureScenarioActive();
       await this.waitForTaskPriority();
-      await this.moveInsideShelter(rallyPoint, true);
+      await this.enterShelterForIndoorTask(rallyPoint, 'sleeping in the shelter');
       const beds = this.getBedSelectionOrder(rallyPoint);
       const freeBeds = beds.filter((bed) => !this.isBedOccupied(bed));
       const decision = this.nightlyShelterSleepDecisionService.evaluate({
@@ -1822,30 +1934,50 @@ export class MineflayerMicroBasePort implements MicroBasePort {
     await this.enterShelterThroughDoor(rallyPoint, closeDoorAfterEntry);
   }
 
+  private async enterShelterForIndoorTask(rallyPoint: BotRallyPoint, taskDescription: string): Promise<void> {
+    await this.moveInsideShelter(rallyPoint, true);
+    this.logger.info(`Entered the shelter for ${taskDescription}.`);
+  }
+
+  private async moveOutsideShelter(rallyPoint: BotRallyPoint): Promise<void> {
+    this.cancelScheduledShelterDoorClose();
+
+    if (!this.isBotInsideShelter(rallyPoint)) {
+      return;
+    }
+
+    await this.exitShelterThroughDoor(rallyPoint);
+  }
+
+  private async exitShelterForOutdoorTask(rallyPoint: BotRallyPoint, taskDescription: string): Promise<void> {
+    await this.moveOutsideShelter(rallyPoint);
+    this.logger.info(`Exited the shelter for ${taskDescription}.`);
+  }
+
   private async enterShelterThroughDoor(
     rallyPoint: BotRallyPoint,
     closeDoorAfterEntry = false,
   ): Promise<void> {
     const doorPosition = this.getShelterDoorPosition(rallyPoint);
-    const interiorAnchor = this.getShelterInteriorAnchor(rallyPoint);
-    const outsideApproach =
-      this.getDoorApproachPositions(doorPosition, rallyPoint).find(
-        (position) =>
-          !this.isInsideShelterArea(position, rallyPoint) &&
-          this.isPassableStandPosition(this.toBlockPosition(position)),
-      ) ??
-      doorPosition;
+    const { outsideApproach, insideDoorStep, insideDepthTarget } = this.getShelterDoorTraversalTargets(
+      doorPosition,
+      rallyPoint,
+    );
 
     for (let attempt = 1; attempt <= this.shelterDoorEntryAttempts; attempt += 1) {
       await this.navigateTo(outsideApproach, 1).catch(() => undefined);
       await this.openShelterDoorIfNeeded(doorPosition);
 
       if (!this.isBotInsideShelter(rallyPoint)) {
-        await this.stepTowards(interiorAnchor, 16);
+        await this.stepTowards(insideDoorStep, 16);
       }
 
       if (!this.isBotInsideShelter(rallyPoint)) {
-        await this.navigateTo(interiorAnchor, 1).catch(() => undefined);
+        await this.navigateTo(insideDoorStep, 1).catch(() => undefined);
+      }
+
+      if (this.isBotInsideShelter(rallyPoint)) {
+        await this.navigateTo(insideDepthTarget, 1).catch(() => undefined);
       }
 
       if (this.isBotInsideShelter(rallyPoint)) {
@@ -1868,6 +2000,41 @@ export class MineflayerMicroBasePort implements MicroBasePort {
     }
 
     throw new Error('Could not enter the shelter through the door.');
+  }
+
+  private async exitShelterThroughDoor(rallyPoint: BotRallyPoint): Promise<void> {
+    const doorPosition = this.getShelterDoorPosition(rallyPoint);
+    const { outsideApproach, insideDoorStep, outsideDepthTarget } = this.getShelterDoorTraversalTargets(
+      doorPosition,
+      rallyPoint,
+    );
+
+    for (let attempt = 1; attempt <= this.shelterDoorEntryAttempts; attempt += 1) {
+      await this.navigateTo(insideDoorStep, 1).catch(() => undefined);
+      await this.openShelterDoorIfNeeded(doorPosition);
+
+      if (this.isBotInsideShelter(rallyPoint)) {
+        await this.stepTowards(outsideApproach, 16);
+      }
+
+      if (this.isBotInsideShelter(rallyPoint)) {
+        await this.navigateTo(outsideApproach, 1).catch(() => undefined);
+      }
+
+      if (!this.isBotInsideShelter(rallyPoint)) {
+        await this.navigateTo(outsideDepthTarget, 1).catch(() => undefined);
+        return;
+      }
+
+      if (attempt < this.shelterDoorEntryAttempts) {
+        this.logger.warn(
+          `The shelter door at ${doorPosition.x} ${doorPosition.y} ${doorPosition.z} stayed in the way while the bot was leaving. Reopening it and retrying (${attempt + 1}/${this.shelterDoorEntryAttempts}).`,
+        );
+        await this.bot.waitForTicks(10);
+      }
+    }
+
+    throw new Error('Could not leave the shelter through the door.');
   }
 
   private getShelterInteriorAnchor(rallyPoint: BotRallyPoint): Vec3 {
@@ -1938,6 +2105,62 @@ export class MineflayerMicroBasePort implements MicroBasePort {
     return this.getDoorApproachPositions(doorPosition, rallyPoint)
       .filter((position) => this.isPassableStandPosition(this.toBlockPosition(position)))
       .sort((left, right) => left.distanceSquared(rallyCenter) - right.distanceSquared(rallyCenter))[0] ?? null;
+  }
+
+  private getShelterDoorTraversalTargets(
+    doorPosition: Vec3,
+    rallyPoint: BotRallyPoint,
+  ): {
+    outsideApproach: Vec3;
+    insideDoorStep: Vec3;
+    insideDepthTarget: Vec3;
+    outsideDepthTarget: Vec3;
+  } {
+    const passableApproaches = this.getDoorApproachPositions(doorPosition, rallyPoint)
+      .filter((position) => this.isPassableStandPosition(this.toBlockPosition(position)));
+    const insideDoorStep =
+      passableApproaches.find((position) => this.isInsideShelterArea(position, rallyPoint)) ??
+      this.getShelterInteriorAnchor(rallyPoint);
+    const outsideApproach =
+      passableApproaches.find((position) => !this.isInsideShelterArea(position, rallyPoint)) ??
+      doorPosition;
+    const inwardOffset = insideDoorStep.minus(doorPosition);
+    const outwardOffset = outsideApproach.minus(doorPosition);
+    const preferredInsideDepthTarget = insideDoorStep.plus(inwardOffset);
+    const preferredOutsideDepthTarget = outsideApproach.plus(outwardOffset);
+
+    return {
+      outsideApproach,
+      insideDoorStep,
+      insideDepthTarget: this.resolveShelterTraversalTarget(
+        preferredInsideDepthTarget,
+        rallyPoint,
+        true,
+        insideDoorStep,
+      ),
+      outsideDepthTarget: this.resolveShelterTraversalTarget(
+        preferredOutsideDepthTarget,
+        rallyPoint,
+        false,
+        outsideApproach,
+      ),
+    };
+  }
+
+  private resolveShelterTraversalTarget(
+    preferredTarget: Vec3,
+    rallyPoint: BotRallyPoint,
+    shouldBeInside: boolean,
+    fallbackTarget: Vec3,
+  ): Vec3 {
+    if (
+      this.isPassableStandPosition(this.toBlockPosition(preferredTarget)) &&
+      this.isInsideShelterArea(preferredTarget, rallyPoint) === shouldBeInside
+    ) {
+      return preferredTarget;
+    }
+
+    return fallbackTarget;
   }
 
   private getDoorApproachPositions(doorPosition: Vec3, rallyPoint: BotRallyPoint): Vec3[] {
@@ -2073,6 +2296,10 @@ export class MineflayerMicroBasePort implements MicroBasePort {
     });
   }
 
+  private cancelScheduledShelterDoorClose(): void {
+    this.shelterDoorCloseScheduleToken += 1;
+  }
+
   private async stepTowards(target: Vec3, ticks: number): Promise<void> {
     await this.bot.lookAt(target.offset(0.5, 0, 0.5), true).catch(() => undefined);
     this.bot.setControlState('forward', true);
@@ -2085,7 +2312,7 @@ export class MineflayerMicroBasePort implements MicroBasePort {
   }
 
   private async ensureShelterDoorClosedBeforeSleeping(rallyPoint: BotRallyPoint): Promise<void> {
-    this.shelterDoorCloseScheduleToken += 1;
+    this.cancelScheduledShelterDoorClose();
     const doorPosition = this.getShelterDoorPosition(rallyPoint);
     await this.closeShelterDoorIfOpen(doorPosition);
   }

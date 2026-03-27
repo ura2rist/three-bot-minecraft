@@ -94,3 +94,27 @@ test('MineflayerNearbyDroppedItemCollector gives up after several pickup retries
     'collector should log when it gives up on an unreachable dropped item',
   );
 });
+
+test('MineflayerNearbyDroppedItemCollector temporarily suppresses a dropped item after giving up on it', async () => {
+  const { bot } = createDroppedItemBot(new Vec3(2, 64, 0));
+  let gotoCalls = 0;
+
+  const collector = new MineflayerNearbyDroppedItemCollector(
+    bot as never,
+    new TestLogger(),
+    async () => {
+      gotoCalls += 1;
+    },
+  );
+
+  const firstCollected = await collector.collectAround(new Vec3(0, 64, 0), 4, 2);
+  const secondCollected = await collector.collectAround(new Vec3(0, 64, 0), 4, 2);
+
+  assert.equal(firstCollected, false);
+  assert.equal(secondCollected, false);
+  assert.equal(
+    gotoCalls,
+    4,
+    'collector should not immediately retry the same unreachable dropped item after it was suppressed',
+  );
+});

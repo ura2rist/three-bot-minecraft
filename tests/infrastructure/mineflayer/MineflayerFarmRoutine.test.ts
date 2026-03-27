@@ -229,17 +229,20 @@ test('MineflayerFarmRoutine visits farm cells in a deterministic expanding ring 
   assert.deepEqual(
     cells.slice(0, 8).map((cell: Vec3) => [cell.x, cell.y, cell.z]),
     [
+      [209, 64, -71],
       [210, 64, -71],
       [211, 64, -71],
-      [211, 64, -70],
-      [211, 64, -69],
-      [210, 64, -69],
-      [209, 64, -69],
       [209, 64, -70],
-      [209, 64, -71],
+      [211, 64, -70],
+      [209, 64, -69],
+      [210, 64, -69],
+      [211, 64, -69],
     ],
   );
   assert.equal(cells.length, 48);
+  assert.equal(cells.some((cell: Vec3) => cell.x === 207 && cell.y === 64 && cell.z === -73), true);
+  assert.equal(cells.some((cell: Vec3) => cell.x === 213 && cell.y === 64 && cell.z === -67), true);
+  assert.equal(cells.some((cell: Vec3) => cell.x === 210 && cell.y === 64 && cell.z === -70), false);
 });
 
 test('MineflayerFarmRoutine normalizes decimal farm points to the nearest block coordinates before scanning cells', () => {
@@ -250,14 +253,14 @@ test('MineflayerFarmRoutine normalizes decimal farm points to the nearest block 
   assert.deepEqual(
     cells.slice(0, 8).map((cell: Vec3) => [cell.x, cell.y, cell.z]),
     [
+      [199, 63, -98],
       [200, 63, -98],
       [201, 63, -98],
-      [201, 63, -97],
-      [201, 63, -96],
-      [200, 63, -96],
-      [199, 63, -96],
       [199, 63, -97],
-      [199, 63, -98],
+      [201, 63, -97],
+      [199, 63, -96],
+      [200, 63, -96],
+      [201, 63, -96],
     ],
   );
 });
@@ -364,6 +367,51 @@ test('MineflayerFarmRoutine harvests a mature crop by actual block type before r
   );
 
   assert.equal(actions.includes('harvest'), true);
+});
+
+test('MineflayerFarmRoutine replaces a non-matching crop in the zone even before it matures', () => {
+  const { routine, bot } = createRoutine([{ name: 'wheat_seeds', count: 16, type: 295 }]);
+
+  bot.blockAt = (position: Vec3) => {
+    if (position.x === 210 && position.y === 65 && position.z === -70) {
+      return {
+        name: 'carrots',
+        position,
+        getProperties: () => ({ age: 2 }),
+      };
+    }
+
+    if (position.x === 210 && position.y === 64 && position.z === -70) {
+      return {
+        name: 'farmland',
+        position,
+      };
+    }
+
+    return null;
+  };
+
+  const inspection = routine.inspectFarmCell(
+    {
+      definition: {
+        plantedItemId: 'wheat_seeds',
+        cropBlockName: 'wheat',
+        matureAge: 7,
+        harvestItemIds: ['wheat', 'wheat_seeds'],
+      },
+      settings: {
+        itemId: 'wheat_seeds',
+        points: [{ x: 210, y: 64, z: -70 }],
+      },
+    },
+    new Vec3(210, 64, -70),
+  );
+
+  assert.deepEqual(inspection, {
+    needsInteraction: true,
+    needsHarvest: true,
+    needsPlanting: true,
+  });
 });
 
 test('MineflayerFarmRoutine returns to the crafting table before crafting a wooden hoe', async () => {
@@ -601,4 +649,60 @@ test('MineflayerFarmRoutine steps onto each farm cell in order after reaching th
     [210, 64, -71, 0],
     [211, 64, -71, 0],
   ]);
+});
+
+test('MineflayerFarmRoutine processes each farm cell only once per zone pass even if duplicates appear', async () => {
+  const { routine, bot } = createRoutine([]);
+  const processedCells: string[] = [];
+
+  bot.entity.position = new Vec3(210, 64, -70);
+  routine.getFarmCells = () => [
+    new Vec3(210, 64, -71),
+    new Vec3(210, 64, -71),
+    new Vec3(211, 64, -71),
+  ];
+  routine.inspectFarmCell = () => ({
+    needsInteraction: true,
+    needsHarvest: false,
+    needsPlanting: true,
+  });
+  routine.moveToFarmCell = async () => true;
+  routine.tendFarmCell = async (_plot: unknown, cell: Vec3) => {
+    processedCells.push(`${cell.x}:${cell.y}:${cell.z}`);
+  };
+
+  const completed = await routine.processFarmZone(
+    {
+      definition: {
+        plantedItemId: 'wheat_seeds',
+        cropBlockName: 'wheat',
+        matureAge: 7,
+        harvestItemIds: ['wheat', 'wheat_seeds'],
+      },
+      settings: {
+        itemId: 'wheat_seeds',
+        points: [{ x: 210, y: 64, z: -70 }],
+      },
+    },
+    { x: 210, y: 64, z: -70 },
+  );
+
+  assert.equal(completed, true);
+  assert.deepEqual(processedCells, ['210:64:-71', '211:64:-71']);
+});
+
+test('MineflayerFarmRoutine treats a transient missing ingredient craft error as a retryable failure', async () => {
+  const { routine, bot } = createRoutine([]);
+
+  bot.registry.itemsByName = {
+    stick: { id: 280 },
+  };
+  bot.recipesFor = () => ([{}]);
+  bot.craft = async () => {
+    throw new Error('missing ingredient');
+  };
+
+  const crafted = await routine.craftSingleItem('stick');
+
+  assert.equal(crafted, false);
 });
